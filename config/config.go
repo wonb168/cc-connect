@@ -133,7 +133,13 @@ type Config struct {
 	// /send API. 0 (the default) means use core.DefaultMaxAttachmentSize
 	// (50 MiB). Raise it to send larger files; the request body limit on the
 	// API side scales with this value to account for base64 expansion.
-	MaxAttachmentSizeMB int `toml:"max_attachment_size_mb,omitempty"`
+	MaxAttachmentSizeMB int          `toml:"max_attachment_size_mb,omitempty"`
+	TurnsDB             TurnsDBConfig `toml:"turns_db"`
+}
+
+// TurnsDBConfig holds the PostgreSQL connection string for turn logging.
+type TurnsDBConfig struct {
+	DSN string `toml:"dsn"`
 }
 
 // CronConfig controls cron job behavior.

@@ -371,6 +371,8 @@ func main() {
 	engines := make([]*core.Engine, 0, len(cfg.Projects))
 	effectiveWorkDirs := make([]string, 0, len(cfg.Projects))
 
+	turnsLogger := core.NewTurnsLogger(cfg.TurnsDB.DSN)
+
 	for _, proj := range cfg.Projects {
 		// Inject project-level run_as_user / run_as_env into the agent's
 		// opts map so agents that support isolation can pick them up
@@ -442,6 +444,7 @@ func main() {
 		}
 		engine.SetShowWorkdirIndicator(showWorkdir)
 		engine.SetReplyFooterEnabled(showFooter)
+		engine.SetTurnsLogger(turnsLogger)
 		engine.SetAttachmentSendEnabled(cfg.AttachmentSend != "off")
 		engine.SetFilterExternalSessions(proj.FilterExternalSessions != nil && *proj.FilterExternalSessions)
 		engine.SetBaseWorkDir(workDir)

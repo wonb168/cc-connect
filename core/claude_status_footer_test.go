@@ -81,31 +81,22 @@ func TestBuildClaudeStatusLineFooter_FullRender(t *testing.T) {
 	e := newClaudeFooterEngine()
 	got := e.buildClaudeStatusLineFooter(nil, session, "/tmp/ws")
 	// 41772 / 1_000_000 = 4.17% → rounds to 4%.
-	// Output is two lines:
-	//   line 1: <model id> · out N · in N cw N cr N · ctx N%
-	//   line 2: <workspace dir>
-	lines := strings.Split(got, "\n")
-	if len(lines) != 2 {
-		t.Fatalf("expected 2 lines (metrics + dir), got %d: %q", len(lines), got)
+	// Output is a single line: <model id> · $X.XX · $X.XX · 上下文 N%
+	if strings.Contains(got, "\n") {
+		t.Fatalf("expected single-line footer (no workdir), got: %q", got)
 	}
-	parts := strings.Split(lines[0], " · ")
-	if len(parts) != 4 {
-		t.Fatalf("expected 4 segments on line 1, got %d: %q", len(parts), lines[0])
+	parts := strings.Split(got, " · ")
+	if len(parts) != 3 {
+		t.Fatalf("expected 3 segments, got %d: %q", len(parts), got)
 	}
 	if parts[0] != "claude-opus-4-7[1m]" {
 		t.Errorf("segment 0 = %q, want raw model id", parts[0])
 	}
-	if parts[1] != "out 168" {
-		t.Errorf("out segment = %q, want %q", parts[1], "out 168")
+	if !strings.HasPrefix(parts[1], "$") {
+		t.Errorf("cost segment = %q, want $X.XX format", parts[1])
 	}
-	if parts[2] != "in 1 cw 971 cr 40.8k" {
-		t.Errorf("in/cw/cr segment = %q, want %q", parts[2], "in 1 cw 971 cr 40.8k")
-	}
-	if parts[3] != "ctx 4%" {
-		t.Errorf("ctx segment = %q, want %q", parts[3], "ctx 4%")
-	}
-	if lines[1] == "" || !strings.Contains(lines[1], "ws") {
-		t.Errorf("line 2 = %q, want workspace path containing 'ws'", lines[1])
+	if parts[2] != "上下文 4%" {
+		t.Errorf("ctx segment = %q, want %q", parts[2], "上下文 4%")
 	}
 }
 
@@ -132,7 +123,7 @@ func TestBuildClaudeStatusLineFooter_FooterDisabled(t *testing.T) {
 }
 
 // TestBuildClaudeStatusLineFooter_HideContextLine hides line 1 (model/tokens/ctx)
-// but keeps line 2 (workdir) — only the workspace path should appear.
+// — workdir is no longer shown, so footer should be empty.
 func TestBuildClaudeStatusLineFooter_HideContextLine(t *testing.T) {
 	session := &controllableAgentSession{
 		model:   "claude-opus-4-7[1m]",
@@ -149,19 +140,13 @@ func TestBuildClaudeStatusLineFooter_HideContextLine(t *testing.T) {
 	e := newClaudeFooterEngine()
 	e.SetShowContextIndicator(false)
 	got := e.buildClaudeStatusLineFooter(nil, session, "/tmp/ws")
-	if strings.Contains(got, "\n") {
-		t.Errorf("line 1 should be hidden — got multi-line footer: %q", got)
-	}
-	if got == "" || !strings.Contains(got, "ws") {
-		t.Errorf("expected workdir-only footer containing 'ws', got %q", got)
-	}
-	if strings.Contains(got, "ctx ") || strings.Contains(got, "out ") {
-		t.Errorf("metrics segments must not appear when show_context_indicator=false: %q", got)
+	if got != "" {
+		t.Errorf("expected empty footer when show_context_indicator=false (workdir removed), got %q", got)
 	}
 }
 
-// TestBuildClaudeStatusLineFooter_HideWorkdirLine hides line 2 (workdir) but
-// keeps line 1 (metrics) — no newline, no path.
+// TestBuildClaudeStatusLineFooter_HideWorkdirLine — workdir is no longer shown
+// regardless, so behavior is same as default: single metrics line.
 func TestBuildClaudeStatusLineFooter_HideWorkdirLine(t *testing.T) {
 	session := &controllableAgentSession{
 		model:   "claude-opus-4-7[1m]",
@@ -179,18 +164,18 @@ func TestBuildClaudeStatusLineFooter_HideWorkdirLine(t *testing.T) {
 	e.SetShowWorkdirIndicator(false)
 	got := e.buildClaudeStatusLineFooter(nil, session, "/tmp/ws")
 	if strings.Contains(got, "\n") {
-		t.Errorf("line 2 should be hidden — got multi-line footer: %q", got)
+		t.Errorf("footer must be single line: %q", got)
 	}
-	if !strings.Contains(got, "ctx ") {
-		t.Errorf("metrics line missing ctx segment: %q", got)
+	if !strings.Contains(got, "上下文 ") {
+		t.Errorf("metrics line missing 上下文 segment: %q", got)
 	}
 	if strings.Contains(got, "ws") {
-		t.Errorf("workspace path must not appear when show_workdir_indicator=false: %q", got)
+		t.Errorf("workspace path must not appear: %q", got)
 	}
 }
 
-// TestBuildClaudeStatusLineFooter_HideBothLines disables both per-line flags
-// while keeping the master reply_footer on — footer collapses to empty.
+// TestBuildClaudeStatusLineFooter_HideBothLines disables show_context_indicator
+// — workdir is removed, so footer collapses to empty.
 func TestBuildClaudeStatusLineFooter_HideBothLines(t *testing.T) {
 	session := &controllableAgentSession{
 		model:   "claude-opus-4-7[1m]",

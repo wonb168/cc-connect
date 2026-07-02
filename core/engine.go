@@ -406,6 +406,8 @@ type Engine struct {
 	showWorkdirIndicator bool
 	replyFooterEnabled   bool
 
+	turnsLogger *TurnsLogger
+
 	// When true, /list etc. only show sessions tracked by cc-connect,
 	// hiding sessions created by direct CLI usage in the same work_dir.
 	// Default false = show all sessions.
@@ -517,6 +519,10 @@ type interactiveState struct {
 	pendingProviderAdd       *pendingProviderAddState
 	lastAutoCompressAt       time.Time
 	lastAutoCompressTokens   int
+
+	// Current turn sender info (set at turn start, read by turn logger).
+	lastUserID   string
+	lastUserName string
 
 	// Unsolicited event reader: a background goroutine that consumes agent
 	// events between user-initiated turns (e.g. background task completions).
@@ -928,6 +934,11 @@ func (e *Engine) SetShowWorkdirIndicator(show bool) {
 // no-ops.
 func (e *Engine) SetReplyFooterEnabled(show bool) {
 	e.replyFooterEnabled = show
+}
+
+// SetTurnsLogger attaches a TurnsLogger that records each completed turn to PostgreSQL.
+func (e *Engine) SetTurnsLogger(l *TurnsLogger) {
+	e.turnsLogger = l
 }
 
 // SetFilterExternalSessions controls whether /list, /switch, /delete, etc.
@@ -3699,6 +3710,10 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 	}
 
 	promptContent := e.buildSenderPrompt(msg.Content, msg.UserID, msg.UserName, msg.Platform, msg.SessionKey, msg.ChannelKey)
+	state.mu.Lock()
+	state.lastUserID = msg.UserID
+	state.lastUserName = msg.UserName
+	state.mu.Unlock()
 
 	sendStart := time.Now()
 	state.mu.Lock()
@@ -5412,6 +5427,33 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 
 			e.noteUserTurnCompleted(state)
 
+			if e.turnsLogger != nil {
+				usage := replyFooterSessionContextUsage(state.agentSession)
+				modelID := replyFooterModel(state.agentSession, replyAgent)
+				var inTok, outTok, cw, cr int
+				var costUSD float64
+				if usage != nil {
+					inTok, outTok, cw, cr = usage.InputTokens, usage.OutputTokens, usage.CacheCreationInputTokens, usage.CachedInputTokens
+					costUSD = calcTokenCost(modelID, "output", outTok) +
+						calcTokenCost(modelID, "input", inTok) +
+						calcTokenCost(modelID, "cache_write", cw) +
+						calcTokenCost(modelID, "cache_read", cr)
+				}
+				e.turnsLogger.Log(TurnRecord{
+					Project:      e.name,
+					UserID:       state.lastUserID,
+					UserName:     state.lastUserName,
+					Model:        modelID,
+					InputTokens:  inTok,
+					OutputTokens: outTok,
+					CacheWrite:   cw,
+					CacheRead:    cr,
+					CostUSD:      costUSD,
+					TurnDuration: turnDuration,
+					RecordedAt:   time.Now(),
+				})
+			}
+
 			normalizedBaseResponse := strings.TrimSpace(baseResponse)
 			state.mu.Lock()
 			suppressDuplicate := normalizedBaseResponse != "" && normalizedBaseResponse == state.sideText
@@ -7031,6 +7073,18 @@ func formatStatusTokenCount(n int) string {
 	}
 }
 
+
+// formatTokenCostUSD renders a USD cost compactly.
+func formatTokenCostUSD(usd float64) string {
+	if usd < 0.01 {
+		return fmt.Sprintf("%.4f", usd)
+	}
+	if usd < 1.0 {
+		return fmt.Sprintf("%.3f", usd)
+	}
+	return fmt.Sprintf("%.2f", usd)
+}
+
 // formatElapsed renders a turn elapsed duration with i18n, in the format used
 // at the top of the rich card status footer.
 //
@@ -7330,11 +7384,7 @@ func (e *Engine) buildClaudeStatusLineFooter(agent Agent, session AgentSession, 
 		}
 
 		// Compose:
-		//   <model id> · [effort:X ·] out N · in N cw N cr N · ctx N%
-		// `·` separates major segments; tokens-in tier (in/cw/cr) groups under
-		// one segment because cw/cr are just cache-tiered variants of input.
-		// Raw model id is preserved (e.g. "claude-opus-4-7[1m]") for diagnostic
-		// clarity over a prettified display name.
+		//   <model id> · [effort:X ·] $X.XX · $X.XX · 上下文 N%
 		var line1Parts []string
 		if model := strings.TrimSpace(replyFooterModel(session, agent)); model != "" {
 			line1Parts = append(line1Parts, model)
@@ -7342,30 +7392,17 @@ func (e *Engine) buildClaudeStatusLineFooter(agent Agent, session AgentSession, 
 		if effort := strings.TrimSpace(replyFooterReasoningEffort(session, agent)); effort != "" {
 			line1Parts = append(line1Parts, "effort:"+effort)
 		}
-		line1Parts = append(line1Parts, fmt.Sprintf("out %s", formatStatusTokenCount(usage.OutputTokens)))
-		line1Parts = append(line1Parts, fmt.Sprintf("in %s cw %s cr %s",
-			formatStatusTokenCount(usage.InputTokens),
-			formatStatusTokenCount(usage.CacheCreationInputTokens),
-			formatStatusTokenCount(usage.CachedInputTokens)))
-		line1Parts = append(line1Parts, fmt.Sprintf("ctx %d%%", pct))
+		modelID := replyFooterModel(session, agent)
+		totalCost := calcTokenCost(modelID, "output", usage.OutputTokens) +
+			calcTokenCost(modelID, "input", usage.InputTokens) +
+			calcTokenCost(modelID, "cache_write", usage.CacheCreationInputTokens) +
+			calcTokenCost(modelID, "cache_read", usage.CachedInputTokens)
+		line1Parts = append(line1Parts, fmt.Sprintf("$%s", formatTokenCostUSD(totalCost)))
+		line1Parts = append(line1Parts, fmt.Sprintf("上下文 %d%%", pct))
 		line1 = strings.Join(line1Parts, " · ")
 	}
 
-	var line2 string
-	if e.showWorkdirIndicator {
-		line2 = replyFooterWorkDir(session, agent, workspaceDir)
-	}
-
-	switch {
-	case line1 != "" && line2 != "":
-		return line1 + "\n" + line2
-	case line1 != "":
-		return line1
-	case line2 != "":
-		return line2
-	default:
-		return ""
-	}
+	return line1
 }
 
 // sendChunksWithStatusFooter splits body across maxPlatformMessageLen and sends
