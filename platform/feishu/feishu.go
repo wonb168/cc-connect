@@ -1440,7 +1440,7 @@ func (p *Platform) dispatchMessage(ctx context.Context, msgType, content string,
 			return
 		}
 		text := stripMentions(textBody.Text, mentions, p.getBotOpenID())
-		if text == "" && quoted.text == "" && len(quoted.images) == 0 {
+		if text == "" && quoted.text == "" && len(quoted.images) == 0 && len(quoted.files) == 0 {
 			slog.Debug(p.tag()+": dropping empty text after mention stripping",
 				"message_id", messageID,
 				"raw_text_len", len(textBody.Text),
@@ -1452,7 +1452,7 @@ func (p *Platform) dispatchMessage(ctx context.Context, msgType, content string,
 			SessionKey: sessionKey, Platform: p.platformName,
 			MessageID: messageID,
 			UserID:    userID, UserName: userName, ChatName: chatName,
-			Content: text, ExtraContent: quoted.text, Images: quoted.images, ReplyCtx: rctx,
+			Content: text, ExtraContent: quoted.text, Images: quoted.images, Files: quoted.files, ReplyCtx: rctx,
 			UserMessageTimeMs: createTimeMs,
 		})
 
@@ -1539,14 +1539,14 @@ func (p *Platform) dispatchMessage(ctx context.Context, msgType, content string,
 	case "post":
 		textParts, images := p.parsePostContent(messageID, content)
 		text := stripMentions(strings.Join(textParts, "\n"), mentions, p.getBotOpenID())
-		if text == "" && len(images) == 0 && quoted.text == "" && len(quoted.images) == 0 {
+		if text == "" && len(images) == 0 && quoted.text == "" && len(quoted.images) == 0 && len(quoted.files) == 0 {
 			return
 		}
 		p.dispatchCoreMessage(&core.Message{
 			SessionKey: sessionKey, Platform: p.platformName,
 			MessageID: messageID,
 			UserID:    userID, UserName: userName, ChatName: chatName,
-			Content: text, ExtraContent: quoted.text, Images: append(quoted.images, images...),
+			Content: text, ExtraContent: quoted.text, Images: append(quoted.images, images...), Files: quoted.files,
 			ReplyCtx:          rctx,
 			UserMessageTimeMs: createTimeMs,
 		})
@@ -1903,12 +1903,14 @@ type chainMessage struct {
 	senderType string // "user" or "app"
 	text       string
 	images     []core.ImageAttachment
+	files      []core.FileAttachment
 	parentID   string
 }
 
 type quotedMessage struct {
 	text   string
 	images []core.ImageAttachment
+	files  []core.FileAttachment
 }
 
 // maxReplyChainDepth is the maximum number of parent messages to traverse
@@ -1926,7 +1928,11 @@ func (p *Platform) fetchQuotedMessage(ctx context.Context, parentID string) quot
 	if len(chain) == 0 {
 		return quotedMessage{}
 	}
-	return quotedMessage{text: formatReplyChain(chain), images: collectReplyChainImages(chain)}
+	return quotedMessage{
+		text:   formatReplyChain(chain),
+		images: collectReplyChainImages(chain),
+		files:  collectReplyChainFiles(chain),
+	}
 }
 
 // resolveBotSenderName returns a display name for a bot sender in a quoted
@@ -1984,6 +1990,7 @@ func (p *Platform) fetchSingleMessage(ctx context.Context, messageID string) *ch
 	// Extract plain text based on message type.
 	var text string
 	var images []core.ImageAttachment
+	var files []core.FileAttachment
 	switch item.MsgType {
 	case "text":
 		var textBody struct {
@@ -2012,12 +2019,32 @@ func (p *Platform) fetchSingleMessage(ctx context.Context, messageID string) *ch
 				images = append(images, core.ImageAttachment{MimeType: mimeType, Data: imgData})
 			}
 		}
+	case "file":
+		var fileBody struct {
+			FileKey  string `json:"file_key"`
+			FileName string `json:"file_name"`
+		}
+		if err := json.Unmarshal([]byte(content), &fileBody); err == nil && fileBody.FileKey != "" {
+			text = fmt.Sprintf("[file: %s]", fileBody.FileName)
+			fileData, err := p.downloadResource(messageID, fileBody.FileKey, "file")
+			if err != nil {
+				slog.Error(p.tag()+": download quoted file failed", "error", err, "message_id", messageID, "key", fileBody.FileKey)
+			} else {
+				files = append(files, core.FileAttachment{
+					MimeType: detectMimeType(fileData),
+					Data:     fileData,
+					FileName: fileBody.FileName,
+				})
+			}
+		} else {
+			text = "[file]"
+		}
 	case "interactive":
 		text = extractInteractiveCardText(content)
 	default:
 		text = fmt.Sprintf("[%s]", item.MsgType)
 	}
-	if text == "" {
+	if text == "" && len(files) == 0 {
 		return nil
 	}
 
@@ -2042,6 +2069,7 @@ func (p *Platform) fetchSingleMessage(ctx context.Context, messageID string) *ch
 		senderType: item.Sender.SenderType,
 		text:       text,
 		images:     images,
+		files:      files,
 		parentID:   item.ParentID,
 	}
 }
@@ -2052,6 +2080,14 @@ func collectReplyChainImages(chain []chainMessage) []core.ImageAttachment {
 		images = append(images, msg.images...)
 	}
 	return images
+}
+
+func collectReplyChainFiles(chain []chainMessage) []core.FileAttachment {
+	var files []core.FileAttachment
+	for _, msg := range chain {
+		files = append(files, msg.files...)
+	}
+	return files
 }
 
 // fetchReplyChain iteratively traverses parent_id links to build a reply chain.
