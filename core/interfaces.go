@@ -277,22 +277,6 @@ type MessageUpdater interface {
 	UpdateMessage(ctx context.Context, replyCtx any, content string) error
 }
 
-// StatusFooterSender is an optional Platform extension for sending a reply
-// with a structured per-turn status footer rendered using platform-specific
-// dim/small styling (e.g. Lark `text_size: "notation"`). Platforms that do
-// not implement it fall back to receiving the footer appended inline to the
-// content via Send/SendWithButtons/...
-type StatusFooterSender interface {
-	SendWithStatusFooter(ctx context.Context, replyCtx any, content, footer string) error
-}
-
-// StatusFooterUpdater is the streaming-preview counterpart of
-// StatusFooterSender: it patches an existing preview message with a final
-// content + structured status footer block.
-type StatusFooterUpdater interface {
-	UpdateMessageWithStatusFooter(ctx context.Context, replyCtx any, content, footer string) error
-}
-
 // ProgressStyleProvider is an optional interface for platforms that expose
 // a preferred style for intermediate progress rendering.
 // Typical values: "legacy", "compact", "card".

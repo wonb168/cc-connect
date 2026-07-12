@@ -313,11 +313,16 @@ func TestBasicUserTurnContractAcrossInputModalities(t *testing.T) {
 
 			platform.waitTextContaining(t, "final answer")
 			texts, _, _, _ := platform.snapshot()
-			if len(texts) != 1 {
-				t.Fatalf("texts = %#v, want exactly one final reply", texts)
+			// One final reply plus the always-on post-reply turn summary
+			// (which now carries the context indicator instead of the reply body).
+			if len(texts) != 2 {
+				t.Fatalf("texts = %#v, want final reply plus turn summary", texts)
 			}
-			if strings.Count(texts[0], "[ctx:") != 1 {
-				t.Fatalf("final reply = %q, want exactly one context indicator", texts[0])
+			if strings.Contains(texts[0], "[ctx:") {
+				t.Fatalf("final reply = %q, want no inline context indicator (moved to turn summary)", texts[0])
+			}
+			if !strings.Contains(texts[1], "context") {
+				t.Fatalf("turn summary = %q, want context indicator", texts[1])
 			}
 		})
 	}
@@ -550,7 +555,10 @@ func TestStreamingPreviewFinalizationContractExposesDuplicateFinalSend(t *testin
 
 	platform.waitPreviewUpdates(t, 1)
 	texts, starts, updates, deletes := platform.snapshotPreviewLifecycle()
-	if len(texts) != 0 || len(starts) != 1 || len(updates) == 0 || len(deletes) != 0 {
+	// texts now carries exactly the always-on post-reply turn summary (sent
+	// via plain Send, separate from the preview lifecycle); the reply body
+	// itself must still finalize entirely through the preview.
+	if len(texts) != 1 || len(starts) != 1 || len(updates) == 0 || len(deletes) != 0 {
 		t.Fatalf(
 			"streaming preview finalization violated: normal final text was sent separately while preview remained active\ntexts=%#v\npreview_starts=%#v\npreview_updates=%#v\npreview_deletes=%#v",
 			texts, starts, updates, deletes,
@@ -619,24 +627,27 @@ func TestStreamingPreviewConfigurationMatrix(t *testing.T) {
 			if tt.wantPreview {
 				platform.waitPreviewUpdates(t, 1)
 			} else {
-				platform.waitSentTexts(t, 1)
+				platform.waitSentTexts(t, 2)
 			}
 
 			texts, starts, updates, deletes := platform.snapshotPreviewLifecycle()
 			if tt.wantPreview {
-				if len(texts) != 0 || len(starts) != 1 || len(updates) == 0 || len(deletes) != 0 {
-					t.Fatalf("preview lifecycle = texts:%#v starts:%#v updates:%#v deletes:%#v, want in-place preview finalize", texts, starts, updates, deletes)
+				// texts carries only the always-on post-reply turn summary
+				// (sent via plain Send); the reply body finalizes via the preview.
+				if len(texts) != 1 || len(starts) != 1 || len(updates) == 0 || len(deletes) != 0 {
+					t.Fatalf("preview lifecycle = texts:%#v starts:%#v updates:%#v deletes:%#v, want in-place preview finalize plus turn summary", texts, starts, updates, deletes)
 				}
-				if !strings.Contains(updates[len(updates)-1], "[ctx:") {
-					t.Fatalf("final preview update = %q, want context indicator", updates[len(updates)-1])
+				if !strings.Contains(texts[0], "context") {
+					t.Fatalf("turn summary = %q, want context indicator", texts[0])
 				}
 				return
 			}
 			if len(starts) != 0 || len(updates) != 0 || len(deletes) != 0 {
 				t.Fatalf("preview lifecycle = starts:%#v updates:%#v deletes:%#v, want no preview when disabled", starts, updates, deletes)
 			}
-			if len(texts) != 1 || !strings.Contains(texts[0], strings.TrimSpace(body)) || strings.Count(texts[0], "[ctx:") != 1 {
-				t.Fatalf("texts = %#v, want one final send with context indicator", texts)
+			// Final body reply plus the always-on turn summary.
+			if len(texts) != 2 || !strings.Contains(texts[0], strings.TrimSpace(body)) || !strings.Contains(texts[1], "context") {
+				t.Fatalf("texts = %#v, want final body reply plus turn summary with context indicator", texts)
 			}
 		})
 	}
@@ -678,41 +689,21 @@ func TestStreamingPreviewMaxCharsOnlyTruncatesIntermediatePreview(t *testing.T) 
 	}
 }
 
+// TestReplyMetadataConfigurationMatrix confirms the legacy per-line toggles
+// (show_context_indicator / reply_footer) are now no-ops: the reply body is
+// always plain text, and the standalone post-reply turn summary — carrying
+// model + cost + context% — always follows regardless of how these flags are
+// set (see buildTurnSummaryMessage).
 func TestReplyMetadataConfigurationMatrix(t *testing.T) {
 	tests := []struct {
 		name       string
 		showCtx    bool
 		showFooter bool
-		want       []string
-		forbid     []string
 	}{
-		{
-			name:       "context_and_footer_on_share_one_line",
-			showCtx:    true,
-			showFooter: true,
-			want:       []string{"answer", "[ctx: ~14%] · glm-5.1 · /tmp/release-agent"},
-		},
-		{
-			name:       "context_off_footer_on_hides_legacy_footer",
-			showCtx:    false,
-			showFooter: true,
-			want:       []string{"answer"},
-			forbid:     []string{"[ctx:", "glm-5.1", "/tmp/release-agent"},
-		},
-		{
-			name:       "context_on_footer_off_plain_answer",
-			showCtx:    true,
-			showFooter: false,
-			want:       []string{"answer"},
-			forbid:     []string{"[ctx:", "glm-5.1", "/tmp/release-agent"},
-		},
-		{
-			name:       "context_and_footer_off_plain_answer",
-			showCtx:    false,
-			showFooter: false,
-			want:       []string{"answer"},
-			forbid:     []string{"[ctx:", "glm-5.1", "/tmp/release-agent"},
-		},
+		{name: "context_and_footer_on_share_one_line", showCtx: true, showFooter: true},
+		{name: "context_off_footer_on_hides_legacy_footer", showCtx: false, showFooter: true},
+		{name: "context_on_footer_off_plain_answer", showCtx: true, showFooter: false},
+		{name: "context_and_footer_off_plain_answer", showCtx: false, showFooter: false},
 	}
 
 	for _, tt := range tests {
@@ -728,18 +719,14 @@ func TestReplyMetadataConfigurationMatrix(t *testing.T) {
 			platform.waitTextContaining(t, "answer")
 
 			texts, _, _, _ := platform.snapshot()
-			if len(texts) != 1 {
-				t.Fatalf("texts = %#v, want exactly one final reply", texts)
+			if len(texts) != 2 {
+				t.Fatalf("texts = %#v, want plain final reply plus turn summary", texts)
 			}
-			for _, want := range tt.want {
-				if !strings.Contains(texts[0], want) {
-					t.Fatalf("reply = %q, want contains %q", texts[0], want)
-				}
+			if texts[0] != "answer" {
+				t.Fatalf("reply = %q, want plain %q regardless of legacy footer flags", texts[0], "answer")
 			}
-			for _, forbidden := range tt.forbid {
-				if strings.Contains(texts[0], forbidden) {
-					t.Fatalf("reply = %q, should not contain %q", texts[0], forbidden)
-				}
+			if !strings.Contains(texts[1], "glm-5.1") || !strings.Contains(texts[1], "context") {
+				t.Fatalf("turn summary = %q, want model and context%% unconditionally", texts[1])
 			}
 		})
 	}
@@ -756,23 +743,25 @@ func TestLongFinalResponseKeepsMetadataOnceAtTail(t *testing.T) {
 
 	engine.ReceiveMessage(platform, turnMessage("long final"))
 
+	// Long response splits into multiple plain-text chunks, followed by the
+	// always-on turn summary carrying the model + context% metadata exactly once.
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		texts, _, _, _ := platform.snapshot()
-		if len(texts) >= 2 {
+		if len(texts) >= 3 {
 			joined := strings.Join(texts, "")
-			if strings.Count(joined, "[ctx:") != 1 || strings.Count(joined, "glm-5.1") != 1 {
+			if strings.Count(joined, "glm-5.1") != 1 {
 				t.Fatalf("chunks = %#v, want metadata exactly once", texts)
 			}
-			if !strings.Contains(texts[len(texts)-1], "[ctx: ~14%] · glm-5.1") {
-				t.Fatalf("last chunk = %q, want metadata at tail", texts[len(texts)-1])
+			if !strings.Contains(texts[len(texts)-1], "glm-5.1") || !strings.Contains(texts[len(texts)-1], "context") {
+				t.Fatalf("last chunk = %q, want turn summary metadata at tail", texts[len(texts)-1])
 			}
 			return
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
 	texts, _, _, _ := platform.snapshot()
-	t.Fatalf("texts = %#v, want long response split into multiple chunks", texts)
+	t.Fatalf("texts = %#v, want long response split into multiple chunks plus turn summary", texts)
 }
 
 func TestDisplayVisibilityConfigurationMatrix(t *testing.T) {
@@ -859,15 +848,20 @@ func TestRichCardModeKeepsToolStepsAndFinalMetadataInOneCard(t *testing.T) {
 	agent.session.releaseFirstResult(core.Event{Type: core.EventResult, Content: "rich final", InputTokens: 28000, Done: true})
 	platform.waitPreviewUpdates(t, 3)
 
+	// texts carries only the always-on post-reply turn summary (model + cost
+	// + context%); the card itself no longer embeds that metadata.
 	texts, starts, updates, deletes := platform.snapshotPreviewLifecycle()
-	if len(texts) != 0 || len(starts) != 1 || len(updates) == 0 || len(deletes) != 0 {
-		t.Fatalf("rich lifecycle = texts:%#v starts:%#v updates:%#v deletes:%#v, want one editable rich card", texts, starts, updates, deletes)
+	if len(texts) != 1 || len(starts) != 1 || len(updates) == 0 || len(deletes) != 0 {
+		t.Fatalf("rich lifecycle = texts:%#v starts:%#v updates:%#v deletes:%#v, want one editable rich card plus turn summary", texts, starts, updates, deletes)
 	}
 	final := updates[len(updates)-1]
-	for _, want := range []string{"status=done", "step=Bash", "rich output", "markdown=rich final", "[ctx: ~14%] · glm-5.1"} {
+	for _, want := range []string{"status=done", "step=Bash", "rich output", "markdown=rich final"} {
 		if !strings.Contains(final, want) {
 			t.Fatalf("final rich card = %q, want contains %q", final, want)
 		}
+	}
+	if !strings.Contains(texts[0], "glm-5.1") || !strings.Contains(texts[0], "context") {
+		t.Fatalf("turn summary = %q, want model and context%%", texts[0])
 	}
 }
 

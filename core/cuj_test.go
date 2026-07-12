@@ -1061,9 +1061,10 @@ func TestCUJ_A1_FirstMessageGetsReply(t *testing.T) {
 func TestCUJ_A2_MultiTurnAgentReceivesHistory(t *testing.T) {
 	env := newCUJEnv(t)
 	env.userSends("alex", "my name is alex")
-	env.waitFor("turn1 reply", 2*time.Second, func() bool { return len(env.plat.getSent()) >= 1 })
+	// Each turn now sends the reply plus the always-on turn summary message.
+	env.waitFor("turn1 reply", 2*time.Second, func() bool { return len(env.plat.getSent()) >= 2 })
 	env.userSends("alex", "what is my name")
-	env.waitFor("turn2 reply", 2*time.Second, func() bool { return len(env.plat.getSent()) >= 2 })
+	env.waitFor("turn2 reply", 2*time.Second, func() bool { return len(env.plat.getSent()) >= 4 })
 
 	// Verify the agent has stored at least 2 user prompts; this guards
 	// against any regression that drops history from the agent's input.

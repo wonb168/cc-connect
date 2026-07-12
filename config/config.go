@@ -133,13 +133,23 @@ type Config struct {
 	// /send API. 0 (the default) means use core.DefaultMaxAttachmentSize
 	// (50 MiB). Raise it to send larger files; the request body limit on the
 	// API side scales with this value to account for base64 expansion.
-	MaxAttachmentSizeMB int          `toml:"max_attachment_size_mb,omitempty"`
-	TurnsDB             TurnsDBConfig `toml:"turns_db"`
+	MaxAttachmentSizeMB int             `toml:"max_attachment_size_mb,omitempty"`
+	PricingSync         PricingSyncConfig `toml:"pricing_sync"`
+	TurnReport          TurnReportConfig  `toml:"turn_report"`
 }
 
-// TurnsDBConfig holds the PostgreSQL connection string for turn logging.
-type TurnsDBConfig struct {
+// PricingSyncConfig holds the read-only PostgreSQL connection used to sync
+// the model pricing table (for footer $ cost display).
+type PricingSyncConfig struct {
 	DSN string `toml:"dsn"`
+}
+
+// TurnReportConfig points at the turn-report-svc microservice that persists
+// per-turn usage records (model/tokens/cost/context%) to PostgreSQL. Keeping
+// this as an HTTP endpoint (rather than a direct DB DSN) decouples cc-connect
+// from the turns table schema.
+type TurnReportConfig struct {
+	URL string `toml:"url"`
 }
 
 // CronConfig controls cron job behavior.

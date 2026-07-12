@@ -2,7 +2,6 @@ package feishu
 
 import (
 	"context"
-	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -1377,76 +1376,6 @@ func TestResolveMentions_MarkdownForcesTextFormat(t *testing.T) {
 	msgType, _ := buildReplyContent(result)
 	if msgType != larkim.MsgTypeText {
 		t.Fatalf("markdown + mention must force MsgTypeText so Feishu fires the mention event; got %s", msgType)
-	}
-}
-
-// TestSendWithStatusFooter_NoFallbackOnNonMentionAt: a bare
-// "@" that is NOT a mention (email, URL) must not degrade SendWithStatusFooter
-// to plain Send — the interactive card must be preserved.
-func TestSendWithStatusFooter_NoFallbackOnNonMentionAt(t *testing.T) {
-	const appID = "cli_footer_at"
-	const appSecret = "secret"
-	const chatID = "oc_test_group"
-
-	var gotMsgType string
-	var gotContent string
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		switch {
-		case r.URL.Path == "/open-apis/auth/v3/tenant_access_token/internal":
-			writeJSON(t, w, map[string]any{"code": 0, "expire": 7200, "tenant_access_token": "t"})
-		case r.URL.Path == "/open-apis/im/v1/messages" && r.Method == http.MethodPost:
-			body, _ := io.ReadAll(r.Body)
-			var req struct {
-				MsgType string `json:"msg_type"`
-				Content string `json:"content"`
-			}
-			if err := json.Unmarshal(body, &req); err != nil {
-				t.Fatalf("unmarshal request body: %v", err)
-			}
-			gotMsgType = req.MsgType
-			gotContent = req.Content
-			writeJSON(t, w, map[string]any{"code": 0, "data": map[string]any{"message_id": "om_ok"}})
-		default:
-			t.Errorf("unexpected path %s", r.URL.Path)
-		}
-	}))
-	defer srv.Close()
-
-	p := &Platform{
-		platformName:    "feishu",
-		domain:          srv.URL,
-		appID:           appID,
-		appSecret:       appSecret,
-		resolveMentions: true,
-		mentionMap:      map[string]string{"BotA": "ou_bot_openid"},
-		client:          lark.NewClient(appID, appSecret, lark.WithOpenBaseUrl(srv.URL), lark.WithHttpClient(srv.Client())),
-		replayClient:    lark.NewClient(appID, appSecret, lark.WithEnableTokenCache(false), lark.WithOpenBaseUrl(srv.URL), lark.WithHttpClient(srv.Client())),
-	}
-	p.chatMemberCache.Store(chatID, &chatMemberEntry{members: map[string]string{"BotA": "ou_bot_openid"}, fetchedAt: time.Now()})
-
-	ctx := context.Background()
-	rc := replyContext{chatID: chatID}
-	for _, tc := range []struct {
-		name        string
-		content     string
-		wantMsgType string
-	}{
-		{"email", "**bold** report sent to a@b.com", larkim.MsgTypeInteractive},
-		{"url", "see [docs](http://x@y.com/z)", larkim.MsgTypeInteractive},
-		{"mention", "hey @BotA review please", larkim.MsgTypeText},
-	} {
-		if err := p.SendWithStatusFooter(ctx, rc, tc.content, "done"); err != nil {
-			t.Fatalf("%s: SendWithStatusFooter error = %v", tc.name, err)
-		}
-		if gotMsgType != tc.wantMsgType {
-			t.Errorf("%s: msg_type = %q, want %q", tc.name, gotMsgType, tc.wantMsgType)
-		}
-		if tc.name == "mention" {
-			if !strings.Contains(gotContent, "ou_bot_openid") || !strings.Contains(gotContent, "done") {
-				t.Errorf("mention: content must contain resolved mention + inline footer; got %s", gotContent)
-			}
-		}
 	}
 }
 

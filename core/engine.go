@@ -397,11 +397,13 @@ type Engine struct {
 	autoCompressMinGap    time.Duration
 	resetOnIdle           time.Duration
 
-	// Reply footer composition flags. The footer renders up to two lines:
-	//   line 1 — model · [effort ·] out/in/cw/cr · ctx%   (gated by showContextIndicator)
-	//   line 2 — workspace directory                       (gated by showWorkdirIndicator)
-	// replyFooterEnabled is the master toggle: when false, no footer is emitted
-	// regardless of the per-line flags.
+	// Legacy reply-footer display flags. The inline card footer these once
+	// controlled was replaced by the standalone post-reply turn-summary
+	// message (see buildTurnSummaryMessage), which is unconditional. These
+	// fields are kept, and their setters still wired from config, purely so
+	// existing config.toml files with show_context_indicator /
+	// show_workdir_indicator / reply_footer set do not fail to parse; they no
+	// longer affect any output.
 	showContextIndicator bool
 	showWorkdirIndicator bool
 	replyFooterEnabled   bool
@@ -4555,6 +4557,25 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 	var lastRichCardLen int
 	var cardMessageID any
 	var partialText string
+	var richCardTitle string    // transient title shown while tool calls run; cleared on first answer text
+	var quietStatusThinking bool // whether thinking event seen this turn
+	var quietToolCount int       // tool calls seen this turn (for quiet status line)
+
+	// buildQuietStatus composes the transient one-liner shown during processing.
+	// Format: "💭 思考中…  🔧 #1  🔧 #2 …"
+	buildQuietStatus := func() string {
+		s := ""
+		if quietStatusThinking {
+			s = "💭 思考中…"
+		}
+		for i := 1; i <= quietToolCount; i++ {
+			if s != "" {
+				s += "  "
+			}
+			s += fmt.Sprintf("🔧 #%d", i)
+		}
+		return s
+	}
 	triggerAutoCompress := false
 	pendingSend := sendDone
 
@@ -4793,8 +4814,26 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				break
 			}
 			if hasRichCard {
-				// When thinking messages are suppressed, skip card creation.
+				// When thinking messages are suppressed, show transient title in the rich card.
 				if !e.display.ThinkingMessages {
+					if e.display.Mode == "quiet" {
+						quietStatusThinking = true
+						richCardTitle = buildQuietStatus()
+						if cardMessageID == nil {
+							card := buildResolvedRichCard(CardStatusThinking, richCardTitle, nil, "", true, "")
+							if starter, ok := p.(PreviewStarter); ok {
+								handle, err := starter.SendPreviewStart(e.ctx, replyCtx, card)
+								if err != nil {
+									slog.Debug("rich card: failed to create thinking-status card", "error", err)
+								} else {
+									cardMessageID = handle
+								}
+							}
+						} else if updater, ok := p.(MessageUpdater); ok {
+							card := buildResolvedRichCard(CardStatusThinking, richCardTitle, nil, partialText, true, "")
+							_ = updater.UpdateMessage(e.ctx, cardMessageID, card)
+						}
+					}
 					break
 				}
 				if thinking := strings.TrimSpace(truncateIf(event.Content, e.display.ThinkingMaxLen)); thinking != "" {
@@ -4806,7 +4845,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 					})
 				}
 				if cardMessageID == nil {
-					card := buildResolvedRichCard(CardStatusThinking, "", toolSteps, partialText, true, e.composeRichStatusFooter(true, turnStart, e.agent, state.agentSession, state.workspaceDir))
+					card := buildResolvedRichCard(CardStatusThinking, "", toolSteps, partialText, true, "")
 					if starter, ok := p.(PreviewStarter); ok {
 						handle, err := starter.SendPreviewStart(e.ctx, replyCtx, card)
 						if err != nil {
@@ -4816,7 +4855,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 						}
 					}
 				} else if updater, ok := p.(MessageUpdater); ok {
-					card := buildResolvedRichCard(CardStatusThinking, "", toolSteps, partialText, true, e.composeRichStatusFooter(true, turnStart, e.agent, state.agentSession, state.workspaceDir))
+					card := buildResolvedRichCard(CardStatusThinking, "", toolSteps, partialText, true, "")
 					if err := updater.UpdateMessage(e.ctx, cardMessageID, card); err != nil {
 						slog.Debug("rich card: failed to update thinking card", "platform", p.Name(), "error", err)
 					}
@@ -4824,8 +4863,23 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				break
 			}
 			// When thinking messages are hidden, behavior depends on display mode:
-			//   quiet:   append separator to keep all text in one card
+			//   quiet:   show thinking excerpt (persistent) + tool status in preview card
 			//   compact: freeze+detach to split text into separate cards
+			if !e.display.ThinkingMessages {
+				if e.display.Mode == "quiet" && sp.canPreview() {
+					quietStatusThinking = true
+					// Build thinking excerpt: first 150 runes of content
+					thinkingExcerpt := event.Content
+					runes := []rune(thinkingExcerpt)
+					if len(runes) > 150 {
+						thinkingExcerpt = string(runes[:150]) + "…"
+					}
+					thinkingExcerpt = strings.TrimSpace(thinkingExcerpt)
+					if thinkingExcerpt != "" {
+						sp.setThinkingStatus("💭 " + thinkingExcerpt)
+					}
+				}
+			}
 			if !e.display.ThinkingMessages && len(textParts) > segmentStart {
 				if e.display.Mode == "quiet" {
 					if sp.canPreview() && sp.appendSeparator("\n\n") {
@@ -4883,8 +4937,26 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 		case EventToolUse:
 			toolCount++
 			if hasRichCard {
-				// When tool messages are suppressed, skip card updates on tool events.
+				// When tool messages are suppressed, show transient tool count in the rich card.
 				if !e.display.ToolMessages {
+					if e.display.Mode == "quiet" {
+						quietToolCount++
+						richCardTitle = buildQuietStatus()
+						if cardMessageID == nil {
+							card := buildResolvedRichCard(CardStatusWorking, richCardTitle, nil, "", true, "")
+							if starter, ok := p.(PreviewStarter); ok {
+								handle, err := starter.SendPreviewStart(e.ctx, replyCtx, card)
+								if err != nil {
+									slog.Debug("rich card: failed to create tool-status card", "error", err)
+								} else {
+									cardMessageID = handle
+								}
+							}
+						} else if updater, ok := p.(MessageUpdater); ok {
+							card := buildResolvedRichCard(CardStatusWorking, richCardTitle, nil, partialText, true, "")
+							_ = updater.UpdateMessage(e.ctx, cardMessageID, card)
+						}
+					}
 					break
 				}
 				toolSteps = append(toolSteps, ToolStep{
@@ -4893,7 +4965,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 					Summary: truncateIf(event.ToolInput, e.display.ToolMaxLen),
 				})
 				if cardMessageID == nil {
-					card := buildResolvedRichCard(CardStatusWorking, "", toolSteps, partialText, true, e.composeRichStatusFooter(true, turnStart, e.agent, state.agentSession, state.workspaceDir))
+					card := buildResolvedRichCard(CardStatusWorking, "", toolSteps, partialText, true, "")
 					if starter, ok := p.(PreviewStarter); ok {
 						handle, err := starter.SendPreviewStart(e.ctx, replyCtx, card)
 						if err != nil {
@@ -4903,7 +4975,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 						}
 					}
 				} else if updater, ok := p.(MessageUpdater); ok {
-					card := buildResolvedRichCard(CardStatusWorking, "", toolSteps, partialText, true, e.composeRichStatusFooter(true, turnStart, e.agent, state.agentSession, state.workspaceDir))
+					card := buildResolvedRichCard(CardStatusWorking, "", toolSteps, partialText, true, "")
 					if err := updater.UpdateMessage(e.ctx, cardMessageID, card); err != nil {
 						slog.Debug("rich card: failed to update tool card", "platform", p.Name(), "error", err)
 					}
@@ -4911,8 +4983,14 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				break
 			}
 			// When tool messages are hidden, behavior depends on display mode:
-			//   quiet:   append separator to keep all text in one card
+			//   quiet:   show transient tool status in preview, cleared when answer arrives
 			//   compact: freeze+detach to split text into separate cards
+			if !e.display.ToolMessages {
+				if e.display.Mode == "quiet" && sp.canPreview() {
+					quietToolCount++
+					sp.setToolStatus(buildQuietStatus())
+				}
+			}
 			if !e.display.ToolMessages && len(textParts) > segmentStart {
 				if e.display.Mode == "quiet" {
 					if sp.canPreview() && sp.appendSeparator("\n\n") {
@@ -5019,7 +5097,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 					if hasRichCard {
 						toolSteps = mergeRichToolResult(toolSteps, event, result, e.display.ToolMaxLen)
 						if cardMessageID == nil {
-							card := buildResolvedRichCard(CardStatusWorking, "", toolSteps, partialText, true, e.composeRichStatusFooter(true, turnStart, e.agent, state.agentSession, state.workspaceDir))
+							card := buildResolvedRichCard(CardStatusWorking, "", toolSteps, partialText, true, "")
 							if starter, ok := p.(PreviewStarter); ok {
 								handle, err := starter.SendPreviewStart(e.ctx, replyCtx, card)
 								if err != nil {
@@ -5029,7 +5107,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 								}
 							}
 						} else if updater, ok := p.(MessageUpdater); ok {
-							card := buildResolvedRichCard(CardStatusWorking, "", toolSteps, partialText, true, e.composeRichStatusFooter(true, turnStart, e.agent, state.agentSession, state.workspaceDir))
+							card := buildResolvedRichCard(CardStatusWorking, "", toolSteps, partialText, true, "")
 							if err := updater.UpdateMessage(e.ctx, cardMessageID, card); err != nil {
 								slog.Debug("rich card: failed to update tool-result card", "platform", p.Name(), "error", err)
 							}
@@ -5081,10 +5159,14 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 					handledByStreamCard = true
 				}
 				if !handledByStreamCard {
+					// Clear transient tool/thinking title on first answer text.
+					if richCardTitle != "" && !silentHold {
+						richCardTitle = ""
+					}
 					if len(textParts) == 0 {
 						if hasRichCard {
 							if cardMessageID == nil && !silentHold {
-								card := buildResolvedRichCard(CardStatusWorking, "", toolSteps, partialText, true, e.composeRichStatusFooter(true, turnStart, e.agent, state.agentSession, state.workspaceDir))
+								card := buildResolvedRichCard(CardStatusWorking, "", toolSteps, partialText, true, "")
 								if starter, ok := p.(PreviewStarter); ok {
 									handle, err := starter.SendPreviewStart(e.ctx, replyCtx, card)
 									if err != nil {
@@ -5108,7 +5190,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 							// here using the accumulated partialText so the card emerges
 							// with the post-prefix content already in body.
 							if cardMessageID == nil {
-								card := buildResolvedRichCard(CardStatusWorking, "", toolSteps, partialText, true, e.composeRichStatusFooter(true, turnStart, e.agent, state.agentSession, state.workspaceDir))
+								card := buildResolvedRichCard(CardStatusWorking, richCardTitle, toolSteps, partialText, true, "")
 								if starter, ok := p.(PreviewStarter); ok {
 									handle, err := starter.SendPreviewStart(e.ctx, replyCtx, card)
 									if err != nil {
@@ -5143,7 +5225,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 									}
 								}
 								if !streamed {
-									card := buildResolvedRichCard(CardStatusWorking, "", toolSteps, partialText, true, e.composeRichStatusFooter(true, turnStart, e.agent, state.agentSession, state.workspaceDir))
+									card := buildResolvedRichCard(CardStatusWorking, richCardTitle, toolSteps, partialText, true, "")
 									if updater, ok := p.(MessageUpdater); ok {
 										if err := updater.UpdateMessage(e.ctx, cardMessageID, card); err == nil {
 											lastRichCardUpdate = time.Now()
@@ -5314,10 +5396,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			}
 
 			// Strip any agent-self-reported "[ctx: ~XX%]" marker so it does not
-			// leak into the delivered text. The on-screen ctx indicator is now
-			// rendered exclusively in the reply footer.
-			sdkPlausible := event.InputTokens >= 100
-			selfPct := parseSelfReportedCtx(fullResponse)
+			// leak into the delivered text.
 			cleanResponse := ctxSelfReportRe.ReplaceAllString(fullResponse, "")
 			cleanResponse = strings.TrimRight(cleanResponse, "\n ")
 			baseResponse := cleanResponse
@@ -5371,36 +5450,6 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				})
 			}
 
-			// statusFooter holds the structured CCD-style footer separately so
-			// platforms implementing StatusFooterSender / StatusFooterUpdater
-			// can render it with smaller/dim styling. Other paths inline-append
-			// it via appendReplyFooter as a fallback. The default
-			// (non-CCD) reply footer keeps its existing inline behavior since
-			// it's a single short line that does not benefit from a separate
-			// card element. In rich mode, the inline-append fallback is
-			// suppressed — the rich card renders an equivalent statusFooter
-			// through BuildRichCard, so re-appending the legacy footer here
-			// would double-print model/ctx/workdir into the card body.
-			var statusFooter string
-			var legacyStatusFooter string
-			if !isSilent {
-				footerContext := replyFooterContextText(replyFooterSessionContextUsage(state.agentSession), e.i18n)
-				if e.showContextIndicator {
-					if sdkPlausible {
-						if text := contextIndicatorText(event.InputTokens); text != "" {
-							footerContext = text
-						}
-					} else if selfPct > 0 {
-						footerContext = fmt.Sprintf("[ctx: ~%d%%]", selfPct)
-					}
-				}
-				if status := e.buildClaudeStatusLineFooter(replyAgent, state.agentSession, workspaceDir); status != "" {
-					statusFooter = status
-				} else if footer := e.buildReplyFooter(replyAgent, state.agentSession, workspaceDir, footerContext); footer != "" {
-					statusFooter = footer
-					legacyStatusFooter = footer
-				}
-			}
 			fullResponse = cleanResponse
 
 			turnDuration := time.Since(turnStart)
@@ -5427,28 +5476,34 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 
 			e.noteUserTurnCompleted(state)
 
+			// turnUsage/turnModelID/turnCostUSD/turnContextPct are computed once
+			// and shared by both the turns-billing log and the post-reply "turn
+			// summary" message below, so the two never disagree on cost/ctx%.
+			turnUsage := replyFooterSessionContextUsage(state.agentSession)
+			turnModelID := replyFooterModel(state.agentSession, replyAgent)
+			var turnInTok, turnOutTok, turnCW, turnCR int
+			var turnCostUSD float64
+			if turnUsage != nil {
+				turnInTok, turnOutTok, turnCW, turnCR = turnUsage.InputTokens, turnUsage.OutputTokens, turnUsage.CacheCreationInputTokens, turnUsage.CachedInputTokens
+				turnCostUSD = calcTokenCost(turnModelID, "output", turnOutTok) +
+					calcTokenCost(turnModelID, "input", turnInTok) +
+					calcTokenCost(turnModelID, "cache_write", turnCW) +
+					calcTokenCost(turnModelID, "cache_read", turnCR)
+			}
+			turnContextPct := contextUsagePct(turnUsage)
+
 			if e.turnsLogger != nil {
-				usage := replyFooterSessionContextUsage(state.agentSession)
-				modelID := replyFooterModel(state.agentSession, replyAgent)
-				var inTok, outTok, cw, cr int
-				var costUSD float64
-				if usage != nil {
-					inTok, outTok, cw, cr = usage.InputTokens, usage.OutputTokens, usage.CacheCreationInputTokens, usage.CachedInputTokens
-					costUSD = calcTokenCost(modelID, "output", outTok) +
-						calcTokenCost(modelID, "input", inTok) +
-						calcTokenCost(modelID, "cache_write", cw) +
-						calcTokenCost(modelID, "cache_read", cr)
-				}
 				e.turnsLogger.Log(TurnRecord{
 					Project:      e.name,
 					UserID:       state.lastUserID,
 					UserName:     state.lastUserName,
-					Model:        modelID,
-					InputTokens:  inTok,
-					OutputTokens: outTok,
-					CacheWrite:   cw,
-					CacheRead:    cr,
-					CostUSD:      costUSD,
+					Model:        turnModelID,
+					InputTokens:  turnInTok,
+					OutputTokens: turnOutTok,
+					CacheWrite:   turnCW,
+					CacheRead:    turnCR,
+					CostUSD:      turnCostUSD,
+					ContextPct:   turnContextPct,
 					TurnDuration: turnDuration,
 					RecordedAt:   time.Now(),
 				})
@@ -5464,7 +5519,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 
 			// --- StreamingCard path ---
 			if streamCard != nil && !streamCard.Failed() {
-				sp.finish("", "") // cleanup preview (should be no-op if card was active)
+				sp.finish("") // cleanup preview (should be no-op if card was active)
 				// Build final card content with full response
 				finalContent := buildCardContent(cardThinkingText, cardToolCalls, fullResponse)
 				if err := streamCard.Finalize(e.ctx, finalContent); err != nil {
@@ -5500,7 +5555,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 						silentBody = strings.TrimRight(stripped, " \t\r\n")
 					}
 					if silentBody != "" || len(toolSteps) > 0 {
-						card := buildResolvedRichCard(CardStatusDone, "", toolSteps, silentBody, false, e.composeRichStatusFooter(false, turnStart, e.agent, state.agentSession, state.workspaceDir))
+						card := buildResolvedRichCard(CardStatusDone, "", toolSteps, silentBody, false, "")
 						if updater, ok := p.(MessageUpdater); ok {
 							if err := updater.UpdateMessage(e.ctx, cardMessageID, card); err != nil {
 								slog.Debug("rich card: failed to finalize card on silent reply", "platform", p.Name(), "error", err)
@@ -5521,12 +5576,8 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				if splitter, ok := p.(MarkdownTableSplitter); ok {
 					parts = splitter.SplitMarkdownByTables(fullResponse, 5)
 				}
-				richStatusFooter := e.composeRichStatusFooter(false, turnStart, e.agent, state.agentSession, state.workspaceDir)
-				if legacyStatusFooter != "" {
-					richStatusFooter = formatElapsed(time.Since(turnStart), false, e.i18n.currentLang()) + "\n" + legacyStatusFooter
-				}
 				finalBody := resolveRichCardMarkdown(parts[0], true)
-				finalCard := richCardSupporter.BuildRichCard(CardStatusDone, "", toolSteps, finalBody, false, richStatusFooter)
+				finalCard := richCardSupporter.BuildRichCard(CardStatusDone, "", toolSteps, finalBody, false, "")
 				if cardMessageID != nil {
 					// Forced final flush via cardkit-v1 streaming text update before
 					// flipping status to Done via full-card Patch. The throttle in the
@@ -5556,7 +5607,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				}
 				for _, overflow := range parts[1:] {
 					overflowBody := resolveRichCardMarkdown(overflow, true)
-					overflowCard := richCardSupporter.BuildRichCard(CardStatusDone, "", nil, overflowBody, false, richStatusFooter)
+					overflowCard := richCardSupporter.BuildRichCard(CardStatusDone, "", nil, overflowBody, false, "")
 					if err := p.Send(e.ctx, replyCtx, overflowCard); err != nil {
 						slog.Error("failed to send overflow rich card", "error", err)
 						return
@@ -5570,31 +5621,46 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				if segmentStart < len(textParts) {
 					unsent := strings.Join(textParts[segmentStart:], "")
 					if unsent != "" {
-						if !sendChunksWithStatusFooter(e.ctx, p, replyCtx, unsent, statusFooter, sendWorkspaceWithError) {
-							return
+						for _, chunk := range splitMessage(unsent, maxPlatformMessageLen) {
+							if err := sendWorkspaceWithError(p, replyCtx, chunk); err != nil {
+								return
+							}
 						}
 					}
 				}
 			} else if suppressDuplicate {
 				sp.discard()
 				metaOnly := strings.TrimSpace(strings.TrimPrefix(fullResponse, baseResponse))
-				if metaOnly != "" || statusFooter != "" {
-					if !sendChunksWithStatusFooter(e.ctx, p, replyCtx, metaOnly, statusFooter, sendWorkspaceWithError) {
-						return
+				if metaOnly != "" {
+					for _, chunk := range splitMessage(metaOnly, maxPlatformMessageLen) {
+						if err := sendWorkspaceWithError(p, replyCtx, chunk); err != nil {
+							return
+						}
 					}
 				}
 				slog.Debug("EventResult: suppressed duplicate side-channel text", "response_len", len(fullResponse))
-			} else if sp.finish(fullResponse, statusFooter) {
-				slog.Debug("EventResult: finalized via stream preview", "response_len", len(fullResponse), "footer_len", len(statusFooter))
+			} else if sp.finish(fullResponse) {
+				slog.Debug("EventResult: finalized via stream preview", "response_len", len(fullResponse))
 			} else {
-				slog.Debug("EventResult: sending via p.Send (preview inactive or failed)", "response_len", len(fullResponse), "footer_len", len(statusFooter))
-				if !sendChunksWithStatusFooter(e.ctx, p, replyCtx, fullResponse, statusFooter, sendWorkspaceWithError) {
-					return
+				slog.Debug("EventResult: sending via p.Send (preview inactive or failed)", "response_len", len(fullResponse))
+				for _, chunk := range splitMessage(fullResponse, maxPlatformMessageLen) {
+					if err := sendWorkspaceWithError(p, replyCtx, chunk); err != nil {
+						return
+					}
 				}
 			}
 
 			if elapsed := time.Since(replyStart); elapsed >= slowPlatformSend {
 				slog.Warn("slow final reply send", "platform", p.Name(), "elapsed", elapsed, "response_len", len(fullResponse))
+			}
+
+			// Send the standalone turn-summary message ("✅ Done · model · cost pts ·
+			// context N%") after the reply body, for non-silent turns only. This
+			// replaces the old inline card footer — it is always sent regardless
+			// of reply_footer / show_context_indicator, since it is not a display
+			// toggle but the user-facing surface for per-turn billing.
+			if !isSilent {
+				e.reply(p, replyCtx, e.buildTurnSummaryMessage(turnModelID, turnCostUSD, turnContextPct))
 			}
 
 			// TTS: async voice reply if enabled (skipped for silent replies)
@@ -5807,7 +5873,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			state.eventsNeedResync = true
 			state.mu.Unlock()
 			if hasRichCard && cardMessageID != nil {
-				errCard := buildResolvedRichCard(CardStatusError, "", toolSteps, partialText, false, e.composeRichStatusFooter(false, turnStart, e.agent, state.agentSession, state.workspaceDir))
+				errCard := buildResolvedRichCard(CardStatusError, "", toolSteps, partialText, false, "")
 				if updater, ok := p.(MessageUpdater); ok {
 					if err := updater.UpdateMessage(e.ctx, cardMessageID, errCard); err != nil {
 						slog.Debug("rich card: failed to update error card", "platform", p.Name(), "error", err)
@@ -5896,7 +5962,7 @@ channelClosed:
 					}
 				}
 			}
-		} else if sp.finish(fullResponse, "") {
+		} else if sp.finish(fullResponse) {
 			slog.Debug("stream preview: finalized in-place (process exited)")
 		} else {
 			for _, chunk := range splitMessage(fullResponse, maxPlatformMessageLen) {
@@ -6899,181 +6965,6 @@ func (e *Engine) commandWorkDir(agent Agent, msg *Message) string {
 	return ""
 }
 
-func (e *Engine) buildReplyFooter(agent Agent, session AgentSession, workspaceDir string, contextLeft string) string {
-	if !e.replyFooterEnabled || agent == nil {
-		return ""
-	}
-
-	var parts []string
-	hasStatus := false
-	if e.showContextIndicator {
-		contextLeft = strings.TrimSpace(contextLeft)
-		contextFirst := strings.HasPrefix(contextLeft, "[ctx:")
-		if contextFirst {
-			parts = append(parts, contextLeft)
-			hasStatus = true
-		}
-		if model := replyFooterModel(session, agent); model != "" {
-			parts = append(parts, model)
-			hasStatus = true
-		}
-		if effort := replyFooterReasoningEffort(session, agent); effort != "" {
-			parts = append(parts, effort)
-			hasStatus = true
-		}
-		if contextFirst {
-			// Already added before model so "[ctx]" stays on the same footer line.
-		} else if contextLeft != "" {
-			parts = append(parts, contextLeft)
-			hasStatus = true
-		} else if usage := e.replyFooterUsageText(session, agent); usage != "" {
-			parts = append(parts, usage)
-			hasStatus = true
-		}
-	}
-	if e.showWorkdirIndicator {
-		if dir := replyFooterWorkDir(session, agent, workspaceDir); dir != "" {
-			parts = append(parts, dir)
-		}
-	}
-	// A workdir alone is not a useful status signal (see #701), so suppress
-	// the entire footer unless at least one status segment from line 1 is
-	// present.
-	if !hasStatus {
-		return ""
-	}
-	return strings.Join(parts, " · ")
-}
-
-// composeRichStatusFooter assembles the multi-line statusFooter passed to
-// RichCardSupporter.BuildRichCard. Layout (skipping any empty line):
-//
-//	line 1: ⏱ <i18n elapsed>                                  (subject to e.replyFooterEnabled)
-//	line 2: model · out N · in N cw N cr N · ctx N%           (subject to e.showContextIndicator)
-//	line 3: <workdir>                                         (subject to e.showWorkdirIndicator)
-//
-// Returns "" when the master replyFooterEnabled toggle is off, or while the
-// turn is still streaming (footer represents finalized turn metadata —
-// token counts aren't yet settled and a live-updating elapsed line creates
-// visual noise during streaming. Header status badge already signals "Working").
-func (e *Engine) composeRichStatusFooter(streaming bool, turnStart time.Time, agent Agent, session AgentSession, workspaceDir string) string {
-	if !e.replyFooterEnabled {
-		return ""
-	}
-	if streaming {
-		return ""
-	}
-	var lines []string
-
-	// Line 1: elapsed timer (now always the "done" form since streaming branch returned above)
-	lines = append(lines, formatElapsed(time.Since(turnStart), streaming, e.i18n.currentLang()))
-
-	// Line 2: model + effort + token usage detail + ctx %
-	if e.showContextIndicator {
-		usage := replyFooterSessionContextUsage(session)
-		model := replyFooterModel(session, agent)
-		effort := replyFooterReasoningEffort(session, agent)
-		if line := buildClaudeStatusLineFooter(model, effort, usage); line != "" {
-			lines = append(lines, line)
-		} else if fallback := e.replyFooterUsageText(session, agent); fallback != "" {
-			// fallback for non-claudecode agents that still expose UsageReporter
-			parts := []string{}
-			if model != "" {
-				parts = append(parts, model)
-			}
-			if effort != "" {
-				parts = append(parts, effort)
-			}
-			parts = append(parts, fallback)
-			lines = append(lines, strings.Join(parts, " · "))
-		}
-	}
-
-	// Line 3: workdir
-	if e.showWorkdirIndicator {
-		if dir := replyFooterWorkDir(session, agent, workspaceDir); dir != "" {
-			lines = append(lines, dir)
-		}
-	}
-
-	return strings.Join(lines, "\n")
-}
-
-// buildClaudeStatusLineFooter renders the rich-card line-2 token-usage detail:
-//
-//	claude-opus-4-7[1m] · xhigh · out 168 · in 1 cw 971 cr 40.8k · ctx 4%
-//
-// Sections (each skipped when its data is missing):
-//   - model: from session GetModel() / agent.Name()
-//   - effort: reasoning_effort (Codex / Claude high/medium/low/xhigh)
-//   - token counts: out (output) · in (new input) · cw (cache create) · cr (cache read)
-//   - ctx %: UsedTokens / ContextWindow, capped at 100%
-//
-// Returns "" when usage is nil and no model is known.
-func buildClaudeStatusLineFooter(model, effort string, usage *ContextUsage) string {
-	var parts []string
-	if model != "" {
-		parts = append(parts, model)
-	}
-	if effort != "" {
-		parts = append(parts, effort)
-	}
-	if usage != nil {
-		var counts []string
-		if usage.OutputTokens > 0 {
-			counts = append(counts, fmt.Sprintf("out %s", formatStatusTokenCount(usage.OutputTokens)))
-		}
-		if usage.InputTokens > 0 {
-			counts = append(counts, fmt.Sprintf("in %s", formatStatusTokenCount(usage.InputTokens)))
-		}
-		if usage.CacheCreationInputTokens > 0 {
-			counts = append(counts, fmt.Sprintf("cw %s", formatStatusTokenCount(usage.CacheCreationInputTokens)))
-		}
-		if usage.CachedInputTokens > 0 {
-			counts = append(counts, fmt.Sprintf("cr %s", formatStatusTokenCount(usage.CachedInputTokens)))
-		}
-		if len(counts) > 0 {
-			parts = append(parts, strings.Join(counts, " "))
-		}
-		if usage.ContextWindow > 0 {
-			used := usage.UsedTokens
-			if used <= 0 && usage.TotalTokens > 0 {
-				used = usage.TotalTokens
-			}
-			if used > 0 {
-				pct := used * 100 / usage.ContextWindow
-				if pct > 100 {
-					pct = 100
-				}
-				parts = append(parts, fmt.Sprintf("ctx %d%%", pct))
-			}
-		}
-	}
-	return strings.Join(parts, " · ")
-}
-
-// formatStatusTokenCount renders an integer token count compactly.
-//
-//	< 1000      -> "168"
-//	< 1_000_000 -> "40.8k"
-//	else        -> "1.2M"
-//
-// Negative inputs clamp to zero (defensive against bad token deltas).
-func formatStatusTokenCount(n int) string {
-	if n < 0 {
-		n = 0
-	}
-	switch {
-	case n < 1000:
-		return fmt.Sprintf("%d", n)
-	case n < 1_000_000:
-		return fmt.Sprintf("%.1fk", float64(n)/1000.0)
-	default:
-		return fmt.Sprintf("%.1fM", float64(n)/1_000_000.0)
-	}
-}
-
-
 // formatTokenCostUSD renders a USD cost compactly.
 func formatTokenCostUSD(usd float64) string {
 	if usd < 0.01 {
@@ -7083,58 +6974,6 @@ func formatTokenCostUSD(usd float64) string {
 		return fmt.Sprintf("%.3f", usd)
 	}
 	return fmt.Sprintf("%.2f", usd)
-}
-
-// formatElapsed renders a turn elapsed duration with i18n, in the format used
-// at the top of the rich card status footer.
-//
-// Streaming = true → "⏱ 运行中 12.3 秒..." / "⏱ Running for 12.3s..."
-// Streaming = false → "⏱ 用时 1 分 23 秒"  / "⏱ Elapsed 1m 23s"
-//
-// Currently supports ZH-family (zh / zh-tw) and EN-default. Other languages
-// (ja / es) fall back to EN format. Could be promoted to full MsgKey i18n
-// later if needed.
-func formatElapsed(d time.Duration, streaming bool, lang Language) string {
-	if d < 0 {
-		d = 0
-	}
-	zh := lang == LangChinese || lang == LangTraditionalChinese
-	totalSec := int64(d / time.Second)
-	var dur string
-	switch {
-	case d < time.Minute:
-		if zh {
-			dur = fmt.Sprintf("%.1f 秒", d.Seconds())
-		} else {
-			dur = fmt.Sprintf("%.1fs", d.Seconds())
-		}
-	case d < time.Hour:
-		m := totalSec / 60
-		s := totalSec % 60
-		if zh {
-			dur = fmt.Sprintf("%d 分 %02d 秒", m, s)
-		} else {
-			dur = fmt.Sprintf("%dm %02ds", m, s)
-		}
-	default:
-		h := totalSec / 3600
-		m := (totalSec % 3600) / 60
-		if zh {
-			dur = fmt.Sprintf("%d 小时 %02d 分", h, m)
-		} else {
-			dur = fmt.Sprintf("%dh %02dm", h, m)
-		}
-	}
-	if streaming {
-		if zh {
-			return fmt.Sprintf("⏱ 运行中 %s...", dur)
-		}
-		return fmt.Sprintf("⏱ Running for %s...", dur)
-	}
-	if zh {
-		return fmt.Sprintf("⏱ 用时 %s", dur)
-	}
-	return fmt.Sprintf("⏱ Elapsed %s", dur)
 }
 
 func replyFooterModel(session AgentSession, agent Agent) string {
@@ -7151,73 +6990,33 @@ func replyFooterModel(session AgentSession, agent Agent) string {
 	return ""
 }
 
-func replyFooterReasoningEffort(session AgentSession, agent Agent) string {
-	if session != nil {
-		if getter, ok := session.(interface{ GetReasoningEffort() string }); ok {
-			if effort := strings.TrimSpace(getter.GetReasoningEffort()); effort != "" {
-				return effort
-			}
-		}
+// contextUsagePct computes the context-window usage percentage (0-100,
+// clamped) from a ContextUsage snapshot. Returns 0 if usage is nil or
+// ContextWindow is not known.
+func contextUsagePct(usage *ContextUsage) int {
+	if usage == nil || usage.ContextWindow <= 0 {
+		return 0
 	}
-	if getter, ok := agent.(interface{ GetReasoningEffort() string }); ok {
-		return strings.TrimSpace(getter.GetReasoningEffort())
+	used := usage.UsedTokens
+	if used <= 0 {
+		used = usage.InputTokens + usage.CachedInputTokens + usage.CacheCreationInputTokens
 	}
-	return ""
+	pct := int(math.Round(float64(used) * 100 / float64(usage.ContextWindow)))
+	if pct < 0 {
+		pct = 0
+	}
+	if pct > 100 {
+		pct = 100
+	}
+	return pct
 }
 
-func (e *Engine) replyFooterUsageText(session AgentSession, agent Agent) string {
-	ctx, cancel := context.WithTimeout(e.ctx, replyFooterUsageTimeout)
-	defer cancel()
-
-	if session != nil {
-		if reporter, ok := session.(UsageReporter); ok {
-			if report, err := reporter.GetUsage(ctx); err == nil {
-				return formatReplyFooterUsage(report, e.i18n)
-			}
-		}
-	}
-
-	reporter, ok := agent.(UsageReporter)
-	if !ok {
-		return ""
-	}
-
-	e.replyFooterMu.Lock()
-	cached := e.replyFooterUsage
-	e.replyFooterMu.Unlock()
-	if !cached.fetchedAt.IsZero() && time.Since(cached.fetchedAt) < replyFooterUsageCacheTTL {
-		return cached.text
-	}
-
-	text := ""
-	if report, err := reporter.GetUsage(ctx); err == nil {
-		text = formatReplyFooterUsage(report, e.i18n)
-	} else if !cached.fetchedAt.IsZero() {
-		text = cached.text
-	}
-
-	e.replyFooterMu.Lock()
-	e.replyFooterUsage = replyFooterUsageCache{text: text, fetchedAt: time.Now()}
-	e.replyFooterMu.Unlock()
-	return text
-}
-
-func formatReplyFooterUsage(report *UsageReport, i18n *I18n) string {
-	if report == nil || i18n == nil {
-		return ""
-	}
-	window, _ := selectUsageWindows(report)
-	if window == nil {
-		return ""
-	}
-	remaining := 100 - window.UsedPercent
-	if remaining < 0 {
-		remaining = 0
-	}
-	if remaining > 100 {
-		remaining = 100
-	}
-	return i18n.Tf(MsgReplyFooterRemaining, remaining)
+// buildTurnSummaryMessage renders the standalone "turn complete" message sent
+// after every non-silent turn: "✅ Done · <model> · <cost> pts · context N%".
+// Unlike the old inline card footer, this is always sent regardless of the
+// reply_footer / show_context_indicator toggles (see #d93dbbc5 follow-up).
+func (e *Engine) buildTurnSummaryMessage(modelID string, costUSD float64, contextPct int) string {
+	return e.i18n.Tf(MsgTurnSummary, modelID, formatTokenCostUSD(costUSD), contextPct)
 }
 
 func replyFooterSessionContextUsage(session AgentSession) *ContextUsage {
@@ -7229,224 +7028,6 @@ func replyFooterSessionContextUsage(session AgentSession) *ContextUsage {
 		return nil
 	}
 	return reporter.GetContextUsage()
-}
-
-func replyFooterContextText(usage *ContextUsage, i18n *I18n) string {
-	if usage == nil || i18n == nil {
-		return ""
-	}
-	if usage.ContextWindow <= 0 {
-		return ""
-	}
-
-	usedTokens := usage.UsedTokens
-	if usedTokens <= 0 {
-		switch {
-		case usage.TotalTokens > 0:
-			usedTokens = usage.TotalTokens
-		case usage.InputTokens > 0 || usage.OutputTokens > 0:
-			usedTokens = usage.InputTokens + usage.OutputTokens
-		default:
-			return ""
-		}
-	}
-
-	baseline := usage.BaselineTokens
-	if baseline < 0 {
-		baseline = 0
-	}
-	if usage.ContextWindow <= baseline {
-		return i18n.Tf(MsgReplyFooterRemaining, 0)
-	}
-
-	effectiveWindow := usage.ContextWindow - baseline
-	effectiveUsed := usedTokens - baseline
-	if effectiveUsed < 0 {
-		effectiveUsed = 0
-	}
-	remaining := effectiveWindow - effectiveUsed
-	if remaining < 0 {
-		remaining = 0
-	}
-
-	left := int(math.Round(float64(remaining) / float64(effectiveWindow) * 100))
-	if left < 0 {
-		left = 0
-	}
-	if left > 100 {
-		left = 100
-	}
-	return i18n.Tf(MsgReplyFooterRemaining, left)
-}
-
-func replyFooterWorkDir(session AgentSession, agent Agent, workspaceDir string) string {
-	dir := strings.TrimSpace(workspaceDir)
-	if dir == "" {
-		if session != nil {
-			if wd, ok := session.(interface{ GetWorkDir() string }); ok {
-				dir = strings.TrimSpace(wd.GetWorkDir())
-			}
-		}
-	}
-	if dir == "" {
-		if switcher, ok := agent.(WorkDirSwitcher); ok {
-			dir = strings.TrimSpace(switcher.GetWorkDir())
-		}
-	}
-	if dir == "" {
-		if wd, ok := agent.(interface{ GetWorkDir() string }); ok {
-			dir = strings.TrimSpace(wd.GetWorkDir())
-		}
-	}
-	if dir == "" {
-		return ""
-	}
-	return compactReplyFooterPath(dir)
-}
-
-func compactReplyFooterPath(path string) string {
-	path = strings.TrimSpace(path)
-	if path == "" {
-		return ""
-	}
-	cleaned := filepath.Clean(path)
-	normalized := normalizeWorkspacePath(cleaned)
-	if home, err := os.UserHomeDir(); err == nil {
-		homeCleaned := filepath.Clean(home)
-		homeNormalized := normalizeWorkspacePath(homeCleaned)
-		for _, candidate := range []struct {
-			path string
-			home string
-		}{
-			{cleaned, homeCleaned},
-			{normalized, homeNormalized},
-			{cleaned, homeNormalized},
-			{normalized, homeCleaned},
-		} {
-			if display, ok := replyFooterHomeRelativePath(candidate.path, candidate.home); ok {
-				return display
-			}
-		}
-	}
-	return filepath.ToSlash(normalized)
-}
-
-func replyFooterHomeRelativePath(path, home string) (string, bool) {
-	if path == "" || home == "" {
-		return "", false
-	}
-	if path == home {
-		return "~", true
-	}
-	prefix := home + string(os.PathSeparator)
-	if strings.HasPrefix(path, prefix) {
-		return "~" + filepath.ToSlash(strings.TrimPrefix(path, home)), true
-	}
-	return "", false
-}
-
-// buildClaudeStatusLineFooter renders a CCD-statusline-style footer for the
-// reply, composed of two lines:
-//
-//	line 1 (controlled by show_context_indicator): <model id> · [effort:X ·] out N · in N cw N cr N · ctx N%
-//	line 2 (controlled by show_workdir_indicator): <workspace dir>
-//
-// Returns "" if reply_footer is disabled, or if the active session does not
-// expose per-turn cache-token data (i.e. this is not claudecode or no result
-// event has arrived yet) so callers fall back to the default footer.
-func (e *Engine) buildClaudeStatusLineFooter(agent Agent, session AgentSession, workspaceDir string) string {
-	if !e.replyFooterEnabled {
-		return ""
-	}
-	usage := replyFooterSessionContextUsage(session)
-	if usage == nil || usage.ContextWindow <= 0 {
-		return ""
-	}
-	// Only emit the CCD-style footer when we have the cache-token signals
-	// that CCD's statusline consumes. Other agents (codex, gemini) fall
-	// through to the default footer.
-	if usage.CachedInputTokens == 0 && usage.CacheCreationInputTokens == 0 {
-		return ""
-	}
-
-	var line1 string
-	if e.showContextIndicator {
-		used := usage.UsedTokens
-		if used <= 0 {
-			used = usage.InputTokens + usage.CachedInputTokens + usage.CacheCreationInputTokens
-		}
-		pct := int(math.Round(float64(used) * 100 / float64(usage.ContextWindow)))
-		if pct < 0 {
-			pct = 0
-		}
-		if pct > 100 {
-			pct = 100
-		}
-
-		// Compose:
-		//   <model id> · [effort:X ·] $X.XX · $X.XX · 上下文 N%
-		var line1Parts []string
-		if model := strings.TrimSpace(replyFooterModel(session, agent)); model != "" {
-			line1Parts = append(line1Parts, model)
-		}
-		if effort := strings.TrimSpace(replyFooterReasoningEffort(session, agent)); effort != "" {
-			line1Parts = append(line1Parts, "effort:"+effort)
-		}
-		modelID := replyFooterModel(session, agent)
-		totalCost := calcTokenCost(modelID, "output", usage.OutputTokens) +
-			calcTokenCost(modelID, "input", usage.InputTokens) +
-			calcTokenCost(modelID, "cache_write", usage.CacheCreationInputTokens) +
-			calcTokenCost(modelID, "cache_read", usage.CachedInputTokens)
-		line1Parts = append(line1Parts, fmt.Sprintf("$%s", formatTokenCostUSD(totalCost)))
-		line1Parts = append(line1Parts, fmt.Sprintf("上下文 %d%%", pct))
-		line1 = strings.Join(line1Parts, " · ")
-	}
-
-	return line1
-}
-
-// sendChunksWithStatusFooter splits body across maxPlatformMessageLen and sends
-// each chunk via the supplied sendFn. The final chunk carries the structured
-// statusFooter: platforms implementing StatusFooterSender render it as a
-// small/dim block; otherwise the footer is appended inline via
-// appendReplyFooter. Returns true on success, false if any send failed (in
-// which case caller should bail). sendFn is the workspace-aware send closure
-// (so the helper picks up workspace transforms like path remapping).
-func sendChunksWithStatusFooter(ctx context.Context, p Platform, replyCtx any, body, statusFooter string, sendFn func(Platform, any, string) error) bool {
-	chunks := splitMessage(body, maxPlatformMessageLen)
-	for i, chunk := range chunks {
-		isLast := i == len(chunks)-1
-		if isLast && statusFooter != "" {
-			if sfs, ok := p.(StatusFooterSender); ok {
-				if err := sfs.SendWithStatusFooter(ctx, replyCtx, chunk, statusFooter); err == nil {
-					continue
-				} else {
-					slog.Warn("SendWithStatusFooter failed, falling back to inline footer", "error", err)
-				}
-			}
-			chunk = appendReplyFooter(chunk, statusFooter)
-		}
-		if err := sendFn(p, replyCtx, chunk); err != nil {
-			return false
-		}
-	}
-	return true
-}
-
-func appendReplyFooter(content, footer string) string {
-	if footer == "" {
-		return content
-	}
-	content = strings.TrimRight(content, "\n")
-	last30 := content
-	if len(last30) > 30 {
-		last30 = last30[len(last30)-30:]
-	}
-	slog.Debug("appendReplyFooter", "content_len", len(content), "footer", footer, "content_last30", last30)
-	if content == "" {
-		return "*" + footer + "*"
-	}
-	return content + "\n\n*" + footer + "*"
 }
 
 func appendFinalMetadataToSegment(segment, fullResponse string) string {
@@ -16543,19 +16124,6 @@ func gitClone(repoURL, dest string) error {
 }
 
 // ── Context usage indicator ──────────────────────────────────
-
-const modelContextWindow = 200_000 // generic fallback window for heuristic context estimates
-
-func contextIndicatorText(inputTokens int) string {
-	if inputTokens <= 0 {
-		return ""
-	}
-	pct := inputTokens * 100 / modelContextWindow
-	if pct > 100 {
-		pct = 100
-	}
-	return fmt.Sprintf("[ctx: ~%d%%]", pct)
-}
 
 // ctxSelfReportRe matches agent self-reported context lines like "[ctx: ~42%]".
 // Used to strip such markers from delivered text — the ctx indicator is now

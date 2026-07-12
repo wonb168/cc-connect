@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"flag"
 	"fmt"
@@ -20,6 +21,8 @@ import (
 	"github.com/chenhg5/cc-connect/config"
 	"github.com/chenhg5/cc-connect/core"
 	"github.com/chenhg5/cc-connect/daemon"
+
+	_ "github.com/lib/pq"
 	// Agent and platform imports are in separate plugin_*.go files
 	// controlled by build tags. See Makefile for selective compilation.
 )
@@ -371,7 +374,18 @@ func main() {
 	engines := make([]*core.Engine, 0, len(cfg.Projects))
 	effectiveWorkDirs := make([]string, 0, len(cfg.Projects))
 
-	turnsLogger := core.NewTurnsLogger(cfg.TurnsDB.DSN)
+	turnsLogger := core.NewTurnsLogger(cfg.TurnReport.URL)
+	if cfg.PricingSync.DSN != "" {
+		if pricingDB, err := sql.Open("postgres", cfg.PricingSync.DSN); err != nil {
+			slog.Warn("pricing_sync: failed to open connection", "error", err)
+		} else if err := pricingDB.Ping(); err != nil {
+			slog.Warn("pricing_sync: ping failed", "error", err)
+			pricingDB.Close()
+		} else {
+			core.LoadModelPricingFromDB(pricingDB)
+			core.RefreshModelPricingFromDB(pricingDB, 10*time.Minute)
+		}
+	}
 
 	for _, proj := range cfg.Projects {
 		// Inject project-level run_as_user / run_as_env into the agent's

@@ -47,6 +47,10 @@ type streamPreview struct {
 	previewMsgID      any  // platform-specific ID for the preview message (returned by SendPreviewStart)
 	degraded          bool // if true, stop trying (platform doesn't support it or permanent error)
 
+	thinkingStatus string // persistent thinking excerpt shown above answer; never cleared
+	toolStatus     string // transient tool-call status line; cleared when answer text arrives
+	hasAnswerText  bool   // true once the first EventText chunk has been appended
+
 	timer     *time.Timer
 	timerStop chan struct{} // closed when preview ends
 
@@ -184,6 +188,10 @@ func (sp *streamPreview) appendText(text string) {
 		return
 	}
 
+	if !sp.hasAnswerText {
+		sp.hasAnswerText = true
+		sp.toolStatus = "" // clear tool status once answer text begins; thinkingStatus is kept
+	}
 	sp.fullText += text
 
 	displayText := sp.fullText
@@ -240,10 +248,27 @@ func (sp *streamPreview) cancelTimerLocked() {
 
 // flushLocked sends the current preview text to the platform. Must hold sp.mu.
 func (sp *streamPreview) flushLocked(text string) {
-	if sp.transform != nil {
-		text = sp.transform(text)
+	display := text
+	// Build header: thinking (persistent) + tools (cleared when answer arrives)
+	var headerParts []string
+	if sp.thinkingStatus != "" {
+		headerParts = append(headerParts, sp.thinkingStatus)
 	}
-	if text == sp.lastSentText || text == "" {
+	if sp.toolStatus != "" && !sp.hasAnswerText {
+		headerParts = append(headerParts, sp.toolStatus)
+	}
+	if len(headerParts) > 0 {
+		header := strings.Join(headerParts, "\n")
+		if text == "" {
+			display = header
+		} else {
+			display = header + "\n\n" + text
+		}
+	}
+	if sp.transform != nil {
+		display = sp.transform(display)
+	}
+	if display == sp.lastSentText || display == "" {
 		return
 	}
 
@@ -257,8 +282,8 @@ func (sp *streamPreview) flushLocked(text string) {
 	if sp.previewMsgID == nil {
 		// First preview: try to send a new preview message
 		if starter, ok := sp.platform.(PreviewStarter); ok {
-			slog.Debug("stream preview: sending first preview via SendPreviewStart", "text_len", len(text))
-			handle, err := starter.SendPreviewStart(sp.ctx, sp.replyCtx, text)
+			slog.Debug("stream preview: sending first preview via SendPreviewStart", "text_len", len(display))
+			handle, err := starter.SendPreviewStart(sp.ctx, sp.replyCtx, display)
 			if err != nil {
 				slog.Debug("stream preview: start failed, degrading", "error", err)
 				sp.degraded = true
@@ -266,27 +291,27 @@ func (sp *streamPreview) flushLocked(text string) {
 			}
 			sp.previewMsgID = handle
 		} else {
-			if err := sp.platform.Send(sp.ctx, sp.replyCtx, text); err != nil {
+			if err := sp.platform.Send(sp.ctx, sp.replyCtx, display); err != nil {
 				slog.Debug("stream preview: initial send failed", "error", err)
 				sp.degraded = true
 				return
 			}
 			sp.previewMsgID = sp.replyCtx
 		}
-		sp.lastSentText = text
+		sp.lastSentText = display
 		sp.lastSentViaUpdate = false
 		sp.lastSentAt = time.Now()
 		return
 	}
 
 	// Update existing preview message
-	slog.Debug("stream preview: updating via UpdateMessage", "text_len", len(text))
-	if err := updater.UpdateMessage(sp.ctx, sp.previewMsgID, text); err != nil {
+	slog.Debug("stream preview: updating via UpdateMessage", "text_len", len(display))
+	if err := updater.UpdateMessage(sp.ctx, sp.previewMsgID, display); err != nil {
 		slog.Debug("stream preview: update failed, degrading", "error", err)
 		sp.degraded = true
 		return
 	}
-	sp.lastSentText = text
+	sp.lastSentText = display
 	sp.lastSentViaUpdate = true
 	sp.lastSentAt = time.Now()
 }
@@ -350,13 +375,7 @@ func (sp *streamPreview) discard() {
 // timer and optionally cleans up the preview message.
 // Returns true if a preview was active and the final message was sent via preview
 // (so the caller should skip sending the full response separately).
-//
-// `statusFooter` is an optional structured footer string (one or more lines)
-// that platforms implementing StatusFooterUpdater render with small/dim
-// styling separate from the body. When the platform does not implement that
-// interface and statusFooter is non-empty, finish falls back to appending the
-// footer inline to finalText before the regular UpdateMessage call.
-func (sp *streamPreview) finish(finalText, statusFooter string) bool {
+func (sp *streamPreview) finish(finalText string) bool {
 	sp.mu.Lock()
 	defer sp.mu.Unlock()
 
@@ -420,18 +439,15 @@ func (sp *streamPreview) finish(finalText, statusFooter string) bool {
 		return false
 	}
 
-	// If the final text is identical to what was last sent via UpdateMessage
-	// AND no status footer needs to be applied, skip the redundant API call.
-	// This prevents duplicate messages on platforms (e.g. Feishu) where
-	// patching with identical content may fail. We must NOT skip when a
-	// statusFooter is pending — the body may match but the footer hasn't
-	// been rendered yet, and dropping the call would silently lose it.
+	// If the final text is identical to what was last sent via UpdateMessage,
+	// skip the redundant API call. This prevents duplicate messages on
+	// platforms (e.g. Feishu) where patching with identical content may fail.
 	// Only skip when lastSentViaUpdate is true — if the text was only sent
 	// via SendPreviewStart (first flush), we must still call UpdateMessage
 	// because it may apply different formatting (e.g. Markdown→HTML for
 	// Telegram).
-	if finalText == sp.lastSentText && sp.lastSentViaUpdate && statusFooter == "" {
-		slog.Debug("stream preview finish: text unchanged and no footer, skipping",
+	if finalText == sp.lastSentText && sp.lastSentViaUpdate {
+		slog.Debug("stream preview finish: text unchanged, skipping",
 			"text_len", len(finalText))
 		return true
 	}
@@ -441,23 +457,7 @@ func (sp *streamPreview) finish(finalText, statusFooter string) bool {
 	// we always attempt a single final update regardless of length.
 	slog.Debug("stream preview finish: sending final UpdateMessage",
 		"text_len", len(finalText), "lastSent_len", len(sp.lastSentText),
-		"same", finalText == sp.lastSentText, "viaUpdate", sp.lastSentViaUpdate,
-		"footer_len", len(statusFooter))
-
-	// Prefer the structured-footer path when the platform supports it, so the
-	// footer renders with small/dim styling separate from the response body.
-	if statusFooter != "" {
-		if sfu, ok := sp.platform.(StatusFooterUpdater); ok {
-			if err := sfu.UpdateMessageWithStatusFooter(sp.ctx, sp.previewMsgID, finalText, statusFooter); err == nil {
-				slog.Debug("stream preview finish: success via UpdateMessageWithStatusFooter")
-				return true
-			} else {
-				slog.Debug("stream preview finish: UpdateMessageWithStatusFooter failed, falling back", "error", err)
-			}
-		}
-		// Fallback: append inline so the footer is at least visible.
-		finalText = appendReplyFooter(finalText, statusFooter)
-	}
+		"same", finalText == sp.lastSentText, "viaUpdate", sp.lastSentViaUpdate)
 
 	if err := updater.UpdateMessage(sp.ctx, sp.previewMsgID, finalText); err != nil {
 		slog.Debug("stream preview finish: final update FAILED, cleaning up preview", "error", err)
@@ -513,6 +513,62 @@ func (sp *streamPreview) appendSeparator(sep string) bool {
 	}
 	sp.fullText += sep
 	return true
+}
+
+// setThinkingStatus appends or updates the persistent thinking excerpt shown in
+// the preview card. Unlike toolStatus it is never cleared by answer text.
+func (sp *streamPreview) setThinkingStatus(status string) {
+	sp.mu.Lock()
+	defer sp.mu.Unlock()
+	if sp.degraded || !sp.cfg.Enabled {
+		return
+	}
+	sp.thinkingStatus = status
+	displayText := sp.fullText
+	maxChars := sp.cfg.MaxChars
+	if maxChars > 0 && len([]rune(displayText)) > maxChars {
+		displayText = string([]rune(displayText)[:maxChars]) + "…"
+	}
+	sp.flushLocked(displayText)
+}
+
+// setToolStatus sets a transient status line shown above the answer text.
+// It is cleared automatically when the first answer text chunk arrives.
+// Pass an empty string to clear it explicitly.
+func (sp *streamPreview) setToolStatus(status string) {
+	sp.mu.Lock()
+	defer sp.mu.Unlock()
+	if sp.degraded || !sp.cfg.Enabled {
+		slog.Info("stream preview: setToolStatus skipped", "degraded", sp.degraded, "enabled", sp.cfg.Enabled, "status", status)
+		return
+	}
+	slog.Info("stream preview: setToolStatus", "status", status, "has_preview", sp.previewMsgID != nil)
+	sp.toolStatus = status
+	// Flush immediately so the tool name appears without waiting for the interval.
+	displayText := sp.fullText
+	maxChars := sp.cfg.MaxChars
+	if maxChars > 0 && len([]rune(displayText)) > maxChars {
+		displayText = string([]rune(displayText)[:maxChars]) + "…"
+	}
+	sp.flushLocked(displayText)
+}
+
+// clearToolStatus removes the transient tool status line and flushes so the
+// card shows only the answer text from now on.
+func (sp *streamPreview) clearToolStatus() {
+	sp.mu.Lock()
+	defer sp.mu.Unlock()
+	if sp.toolStatus == "" && sp.hasAnswerText {
+		return
+	}
+	sp.toolStatus = ""
+	sp.hasAnswerText = true
+	displayText := sp.fullText
+	maxChars := sp.cfg.MaxChars
+	if maxChars > 0 && len([]rune(displayText)) > maxChars {
+		displayText = string([]rune(displayText)[:maxChars]) + "…"
+	}
+	sp.flushLocked(displayText)
 }
 
 // needsDoneReaction returns true if the preview was delivered via in-place

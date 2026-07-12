@@ -297,6 +297,7 @@ const (
 
 	MsgStatusTitle           MsgKey = "status_title"
 	MsgReplyFooterRemaining  MsgKey = "reply_footer_remaining"
+	MsgTurnSummary           MsgKey = "turn_summary"
 	MsgModelCurrent          MsgKey = "model_current"
 	MsgModelChanged          MsgKey = "model_changed"
 	MsgModelChangeFailed     MsgKey = "model_change_failed"
@@ -2193,6 +2194,13 @@ var messages = map[MsgKey]map[Language]string{
 		LangTraditionalChinese: "剩餘 %d%%",
 		LangJapanese:           "残り %d%%",
 		LangSpanish:            "%d%% restante",
+	},
+	MsgTurnSummary: {
+		LangEnglish:            "✅ Done · %s · %s pts · context %d%%",
+		LangChinese:            "✅ 完成 · %s · %s 点 · 上下文 %d%%",
+		LangTraditionalChinese: "✅ 完成 · %s · %s 點 · 上下文 %d%%",
+		LangJapanese:           "✅ 完了 · %s · %s ポイント · コンテキスト %d%%",
+		LangSpanish:            "✅ Listo · %s · %s pts · contexto %d%%",
 	},
 	MsgModelCurrent: {
 		LangEnglish:            "Current model: %s",

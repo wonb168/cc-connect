@@ -1471,35 +1471,6 @@ func containsMarkdownLine(content string, want string) bool {
 	return false
 }
 
-func TestBuildCardJSONWithStatusFooter_SharesCardTableBudget(t *testing.T) {
-	body := strings.Join([]string{
-		"| A |",
-		"|---|",
-		"| 1 |",
-		"",
-		"| B |",
-		"|---|",
-		"| 2 |",
-	}, "\n")
-	footer := strings.Join([]string{
-		"| C |",
-		"|---|",
-		"| 3 |",
-		"",
-		"| D |",
-		"|---|",
-		"| 4 |",
-	}, "\n")
-
-	content := strings.Join(collectCardMarkdownContents(t, buildCardJSONWithStatusFooter(body, footer)), "\n")
-	if !strings.Contains(content, "| C |\n|---|\n| 3 |") {
-		t.Fatalf("third table should remain renderable, got %q", content)
-	}
-	if !strings.Contains(content, "```\n| D |\n|---|\n| 4 |\n```") {
-		t.Fatalf("fourth table across card elements should be downgraded, got %q", content)
-	}
-}
-
 func TestFeishuCardAPIErrorClassification(t *testing.T) {
 	rateLimitErr := classifyFeishuCardAPIError("stream", 230020, "rate limited")
 	if !errors.Is(rateLimitErr, errFeishuCardRateLimited) {

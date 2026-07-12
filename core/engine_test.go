@@ -694,25 +694,6 @@ func (a *stubUsageAgent) GetUsage(_ context.Context) (*UsageReport, error) {
 	return a.report, a.err
 }
 
-type stubReplyFooterAgent struct {
-	stubModelModeAgent
-	workDir string
-	report  *UsageReport
-	err     error
-}
-
-func (a *stubReplyFooterAgent) SetWorkDir(dir string) {
-	a.workDir = dir
-}
-
-func (a *stubReplyFooterAgent) GetWorkDir() string {
-	return a.workDir
-}
-
-func (a *stubReplyFooterAgent) GetUsage(_ context.Context) (*UsageReport, error) {
-	return a.report, a.err
-}
-
 func newTestEngine() *Engine {
 	return NewEngine("test", &stubAgent{}, []Platform{&stubPlatformEngine{n: "test"}}, "", LangEnglish)
 }
@@ -1019,8 +1000,9 @@ func TestProcessInteractiveEvents_SuppressesDuplicateSideChannelText(t *testing.
 	agentSession.events <- Event{Type: EventResult, Content: sideText, Done: true}
 	e.processInteractiveEvents(state, session, e.sessions, sessionKey, "m1", time.Now(), nil, nil, nil)
 
-	if got := p.getSent(); len(got) != 1 || got[0] != sideText {
-		t.Fatalf("sent text = %#v, want one side-channel message", got)
+	// One side-channel message plus the always-on post-reply turn summary.
+	if got := p.getSent(); len(got) != 2 || got[0] != sideText {
+		t.Fatalf("sent text = %#v, want one side-channel message plus turn summary", got)
 	}
 }
 
@@ -1049,8 +1031,9 @@ func TestProcessInteractiveEvents_SuppressesDuplicateSideChannelTextWithContextI
 	agentSession.events <- Event{Type: EventResult, Content: sideText, InputTokens: 52000, Done: true}
 	e.processInteractiveEvents(state, session, e.sessions, sessionKey, "m1", time.Now(), nil, nil, nil)
 
-	if got := p.getSent(); len(got) != 1 || got[0] != sideText {
-		t.Fatalf("sent text = %#v, want only the side-channel message without duplicate ctx reply", got)
+	// One side-channel message plus the always-on post-reply turn summary.
+	if got := p.getSent(); len(got) != 2 || got[0] != sideText {
+		t.Fatalf("sent text = %#v, want only the side-channel message without duplicate ctx reply, plus turn summary", got)
 	}
 }
 
@@ -1079,8 +1062,9 @@ func TestProcessInteractiveEvents_DoesNotSuppressDifferentFinalText(t *testing.T
 	agentSession.events <- Event{Type: EventResult, Content: finalText, Done: true}
 	e.processInteractiveEvents(state, session, e.sessions, sessionKey, "m1", time.Now(), nil, nil, nil)
 
-	if got := p.getSent(); len(got) != 2 || got[0] == got[1] {
-		t.Fatalf("sent text = %#v, want side-channel and final reply", got)
+	// side-channel message, final reply, plus the always-on turn summary.
+	if got := p.getSent(); len(got) != 3 || got[0] == got[1] {
+		t.Fatalf("sent text = %#v, want side-channel, final reply, and turn summary", got)
 	}
 	if got := p.getSent()[1]; got != finalText {
 		t.Fatalf("final sent text = %q, want %q", got, finalText)
@@ -1143,153 +1127,20 @@ func TestProcessInteractiveEvents_NonTerminalResultContinuesTurn(t *testing.T) {
 		t.Fatalf("lastCompletedUserMessageTimeMs = %d, want 100 (noteUserTurnCompleted should run exactly once on terminal result)", gotCompleted)
 	}
 
-	// The final text must have been sent to the platform. The compaction
-	// event must NOT have produced an empty reply.
+	// The final text must have been sent to the platform, immediately
+	// followed by the always-on turn summary. The compaction event must NOT
+	// have produced an empty reply.
 	sent := p.getSent()
-	if len(sent) == 0 {
-		t.Fatalf("no message sent; want at least the final reply %q", finalText)
+	if len(sent) < 2 {
+		t.Fatalf("sent = %#v, want at least the final reply %q plus turn summary", sent, finalText)
 	}
-	if sent[len(sent)-1] != finalText {
-		t.Fatalf("last sent = %q, want %q (compaction empty reply must not leak, final reply must arrive)", sent[len(sent)-1], finalText)
+	if sent[len(sent)-2] != finalText {
+		t.Fatalf("second-to-last sent = %q, want %q (compaction empty reply must not leak, final reply must arrive)", sent[len(sent)-2], finalText)
 	}
 	for i, msg := range sent {
 		if msg == "" {
 			t.Fatalf("sent[%d] is empty — compaction must not produce an empty message; all sent=%v", i, sent)
 		}
-	}
-}
-
-func TestProcessInteractiveEvents_AppendsReplyFooterWhenEnabled(t *testing.T) {
-	homeDir := t.TempDir()
-	t.Setenv("HOME", homeDir)
-	t.Setenv("USERPROFILE", homeDir)
-	workDir := filepath.Join(homeDir, "codes", "cc-connect")
-	if err := os.MkdirAll(workDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-
-	agent := &stubReplyFooterAgent{
-		stubModelModeAgent: stubModelModeAgent{
-			model:           "gpt-5.4",
-			reasoningEffort: "xhigh",
-		},
-		workDir: workDir,
-		report: &UsageReport{
-			Buckets: []UsageBucket{{
-				Name: "Rate limit",
-				Windows: []UsageWindow{{
-					Name:          "Primary",
-					UsedPercent:   0,
-					WindowSeconds: 18000,
-				}},
-			}},
-		},
-	}
-	p := &stubPlatformEngine{n: "telegram"}
-	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
-	e.SetReplyFooterEnabled(true)
-
-	sessionKey := "telegram:user-footer"
-	session := e.sessions.GetOrCreateActive(sessionKey)
-	agentSession := newControllableSession("s-footer")
-	state := &interactiveState{
-		agentSession: agentSession,
-		platform:     p,
-		replyCtx:     "ctx-footer",
-	}
-	e.interactiveStates[sessionKey] = state
-
-	agentSession.events <- Event{Type: EventResult, Content: "answer", Done: true}
-	e.processInteractiveEvents(state, session, e.sessions, sessionKey, "m-footer", time.Now(), nil, nil, state.replyCtx)
-
-	sent := p.getSent()
-	if len(sent) != 1 {
-		t.Fatalf("sent = %#v, want one final reply", sent)
-	}
-	want := "answer\n\n*gpt-5.4 · xhigh · 100% left · " + compactReplyFooterPath(workDir) + "*"
-	if sent[0] != want {
-		t.Fatalf("final reply = %q, want %q", sent[0], want)
-	}
-}
-
-func TestProcessInteractiveEvents_AppendsContextIndicatorInsideReplyFooter(t *testing.T) {
-	homeDir := t.TempDir()
-	t.Setenv("HOME", homeDir)
-	t.Setenv("USERPROFILE", homeDir)
-
-	workDir := filepath.Join(homeDir, "code", "TechStudio", "projects", "core", "agents", "ceo")
-	agent := &stubReplyFooterAgent{
-		stubModelModeAgent: stubModelModeAgent{model: "glm-5.1"},
-		workDir:            workDir,
-	}
-	p := &stubPlatformEngine{n: "telegram"}
-	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
-	e.SetReplyFooterEnabled(true)
-
-	sessionKey := "telegram:user-footer-context"
-	session := e.sessions.GetOrCreateActive(sessionKey)
-	agentSession := newControllableSession("s-footer-context")
-	state := &interactiveState{
-		agentSession: agentSession,
-		platform:     p,
-		replyCtx:     "ctx-footer-context",
-		agent:        agent,
-	}
-	e.interactiveStates[sessionKey] = state
-
-	agentSession.events <- Event{Type: EventResult, Content: "answer", InputTokens: 28000, Done: true}
-	e.processInteractiveEvents(state, session, e.sessions, sessionKey, "m-footer-context", time.Now(), nil, nil, state.replyCtx)
-
-	sent := p.getSent()
-	if len(sent) != 1 {
-		t.Fatalf("sent = %#v, want one final reply", sent)
-	}
-	want := "answer\n\n*[ctx: ~14%] · glm-5.1 · " + compactReplyFooterPath(workDir) + "*"
-	if sent[0] != want {
-		t.Fatalf("final reply = %q, want %q", sent[0], want)
-	}
-}
-
-func TestProcessInteractiveEvents_ToolSegmentsKeepFinalFooter(t *testing.T) {
-	homeDir := t.TempDir()
-	t.Setenv("HOME", homeDir)
-	t.Setenv("USERPROFILE", homeDir)
-
-	workDir := filepath.Join(homeDir, "code", "TechStudio", "projects", "core", "agents", "ceo")
-	agent := &stubReplyFooterAgent{
-		stubModelModeAgent: stubModelModeAgent{model: "glm-5.1"},
-		workDir:            workDir,
-	}
-	p := &stubPlatformEngine{n: "telegram"}
-	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
-	e.SetReplyFooterEnabled(true)
-	e.SetDisplayConfig(DisplayCfg{ThinkingMessages: true, ThinkingMaxLen: 300, ToolMaxLen: 500, ToolMessages: true})
-
-	sessionKey := "telegram:user-tool-footer"
-	session := e.sessions.GetOrCreateActive(sessionKey)
-	agentSession := newControllableSession("s-tool-footer")
-	state := &interactiveState{
-		agentSession: agentSession,
-		platform:     p,
-		replyCtx:     "ctx-tool-footer",
-		agent:        agent,
-	}
-	e.interactiveStates[sessionKey] = state
-
-	agentSession.events <- Event{Type: EventText, Content: "先检查一下。"}
-	agentSession.events <- Event{Type: EventToolUse, ToolName: "Bash", ToolInput: "pwd"}
-	agentSession.events <- Event{Type: EventText, Content: "已处理完成。"}
-	agentSession.events <- Event{Type: EventResult, Content: "已处理完成。", InputTokens: 28000, Done: true}
-	e.processInteractiveEvents(state, session, e.sessions, sessionKey, "m-tool-footer", time.Now(), nil, nil, state.replyCtx)
-
-	sent := p.getSent()
-	if len(sent) == 0 {
-		t.Fatal("sent = nil, want final reply")
-	}
-	final := sent[len(sent)-1]
-	want := "已处理完成。\n\n*[ctx: ~14%] · glm-5.1 · " + compactReplyFooterPath(workDir) + "*"
-	if final != want {
-		t.Fatalf("final reply = %q, want %q\nall sent = %#v", final, want, sent)
 	}
 }
 
@@ -1313,9 +1164,10 @@ func TestProcessInteractiveEvents_DropsStandaloneEllipsisProgress(t *testing.T) 
 	agentSession.events <- Event{Type: EventResult, Content: "done", Done: true}
 	e.processInteractiveEvents(state, session, e.sessions, sessionKey, "m-ellipsis", time.Now(), nil, nil, state.replyCtx)
 
+	// Final answer plus the always-on turn summary.
 	sent := p.getSent()
-	if len(sent) != 1 || sent[0] != "done" {
-		t.Fatalf("sent = %#v, want only final answer without standalone ellipsis progress", sent)
+	if len(sent) != 2 || sent[0] != "done" {
+		t.Fatalf("sent = %#v, want only final answer (plus turn summary) without standalone ellipsis progress", sent)
 	}
 }
 
@@ -1345,162 +1197,6 @@ func TestProcessInteractiveEvents_AddsDoneReactionAfterNormalReply(t *testing.T)
 	}
 }
 
-func TestProcessInteractiveEvents_DoesNotAppendReplyFooterWhenDisabled(t *testing.T) {
-	homeDir := t.TempDir()
-	t.Setenv("HOME", homeDir)
-
-	agent := &stubReplyFooterAgent{
-		stubModelModeAgent: stubModelModeAgent{
-			model:           "gpt-5.4",
-			reasoningEffort: "xhigh",
-		},
-		workDir: filepath.Join(homeDir, "codes", "cc-connect"),
-		report: &UsageReport{
-			Buckets: []UsageBucket{{
-				Name: "Rate limit",
-				Windows: []UsageWindow{{
-					Name:          "Primary",
-					UsedPercent:   0,
-					WindowSeconds: 18000,
-				}},
-			}},
-		},
-	}
-	p := &stubPlatformEngine{n: "telegram"}
-	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
-	e.SetReplyFooterEnabled(false)
-
-	sessionKey := "telegram:user-footer-off"
-	session := e.sessions.GetOrCreateActive(sessionKey)
-	agentSession := newControllableSession("s-footer-off")
-	state := &interactiveState{
-		agentSession: agentSession,
-		platform:     p,
-		replyCtx:     "ctx-footer-off",
-	}
-	e.interactiveStates[sessionKey] = state
-
-	agentSession.events <- Event{Type: EventResult, Content: "answer", Done: true}
-	e.processInteractiveEvents(state, session, e.sessions, sessionKey, "m-footer-off", time.Now(), nil, nil, state.replyCtx)
-
-	sent := p.getSent()
-	if len(sent) != 1 {
-		t.Fatalf("sent = %#v, want one final reply", sent)
-	}
-	if sent[0] != "answer" {
-		t.Fatalf("final reply = %q, want plain answer without footer", sent[0])
-	}
-}
-
-func TestProcessInteractiveEvents_ReplyFooterPrefersSessionRuntimeState(t *testing.T) {
-	homeDir := t.TempDir()
-	t.Setenv("HOME", homeDir)
-	t.Setenv("USERPROFILE", homeDir)
-	if err := os.MkdirAll(filepath.Join(homeDir, "codes", "cc-connect"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-
-	agent := &stubReplyFooterAgent{
-		stubModelModeAgent: stubModelModeAgent{
-			model:           "agent-model",
-			reasoningEffort: "medium",
-		},
-		workDir: filepath.Join(homeDir, "codes", "agent-default"),
-		report: &UsageReport{
-			Buckets: []UsageBucket{{
-				Name: "Rate limit",
-				Windows: []UsageWindow{{
-					Name:          "Primary",
-					UsedPercent:   80,
-					WindowSeconds: 18000,
-				}},
-			}},
-		},
-	}
-	p := &stubPlatformEngine{n: "telegram"}
-	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
-	e.SetReplyFooterEnabled(true)
-
-	sessionKey := "telegram:user-footer-runtime"
-	session := e.sessions.GetOrCreateActive(sessionKey)
-	agentSession := newControllableSession("s-footer-runtime")
-	agentSession.model = "gpt-5.4"
-	agentSession.reasoningEffort = "xhigh"
-	sessionWorkDir := filepath.Join(homeDir, "codes", "cc-connect")
-	agentSession.workDir = sessionWorkDir
-	agentSession.report = &UsageReport{
-		Buckets: []UsageBucket{{
-			Name: "Rate limit",
-			Windows: []UsageWindow{{
-				Name:          "Primary",
-				UsedPercent:   0,
-				WindowSeconds: 18000,
-			}},
-		}},
-	}
-	agentSession.contextUsage = &ContextUsage{
-		UsedTokens:     181424,
-		BaselineTokens: 12000,
-		TotalTokens:    50821769,
-		ContextWindow:  258400,
-	}
-	state := &interactiveState{
-		agentSession: agentSession,
-		platform:     p,
-		replyCtx:     "ctx-footer-runtime",
-		agent:        agent,
-	}
-	e.interactiveStates[sessionKey] = state
-
-	agentSession.events <- Event{Type: EventResult, Content: "answer", Done: true}
-	e.processInteractiveEvents(state, session, e.sessions, sessionKey, "m-footer-runtime", time.Now(), nil, nil, state.replyCtx)
-
-	sent := p.getSent()
-	if len(sent) != 1 {
-		t.Fatalf("sent = %#v, want one final reply", sent)
-	}
-	want := "answer\n\n*gpt-5.4 · xhigh · 31% left · " + compactReplyFooterPath(sessionWorkDir) + "*"
-	if sent[0] != want {
-		t.Fatalf("final reply = %q, want %q", sent[0], want)
-	}
-}
-
-// Regression: an agent that only exposes a workdir (no model/effort/usage)
-// must not emit a footer at all. Previously this produced a footer like
-// "*~*" when the agent was running in the user's home directory, which
-// rendered as a bare "~" on Feishu/Weixin.
-func TestProcessInteractiveEvents_SuppressesReplyFooterWhenOnlyWorkDir(t *testing.T) {
-	homeDir := t.TempDir()
-	t.Setenv("HOME", homeDir)
-
-	agent := &stubWorkDirAgent{workDir: homeDir}
-	p := &stubPlatformEngine{n: "telegram"}
-	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
-	e.SetReplyFooterEnabled(true)
-
-	sessionKey := "telegram:user-footer-workdir-only"
-	session := e.sessions.GetOrCreateActive(sessionKey)
-	agentSession := newControllableSession("s-footer-workdir-only")
-	state := &interactiveState{
-		agentSession: agentSession,
-		platform:     p,
-		replyCtx:     "ctx-footer-workdir-only",
-		agent:        agent,
-	}
-	e.interactiveStates[sessionKey] = state
-
-	agentSession.events <- Event{Type: EventResult, Content: "answer", Done: true}
-	e.processInteractiveEvents(state, session, e.sessions, sessionKey, "m-footer-workdir-only", time.Now(), nil, nil, state.replyCtx)
-
-	sent := p.getSent()
-	if len(sent) != 1 {
-		t.Fatalf("sent = %#v, want one final reply", sent)
-	}
-	if sent[0] != "answer" {
-		t.Fatalf("final reply = %q, want plain answer without footer", sent[0])
-	}
-}
-
 func TestProcessInteractiveEvents_HiddenToolProgressKeepsPreviewOnFinalize(t *testing.T) {
 	p := &mockKeepPreviewPlatform{}
 	p.n = "feishu"
@@ -1522,8 +1218,10 @@ func TestProcessInteractiveEvents_HiddenToolProgressKeepsPreviewOnFinalize(t *te
 
 	e.processInteractiveEvents(state, session, e.sessions, sessionKey, "m1", time.Now(), nil, nil, nil)
 
-	if got := p.getSent(); len(got) != 0 {
-		t.Fatalf("sent text = %#v, want no plain-text fallback sends", got)
+	// No plain-text fallback sends of the reply body itself; the only entry
+	// via p.Send is the always-on post-reply turn summary.
+	if got := p.getSent(); len(got) != 1 {
+		t.Fatalf("sent text = %#v, want only the turn summary (no plain-text fallback sends)", got)
 	}
 
 	p.mu.Lock()
@@ -1561,20 +1259,22 @@ func TestProcessInteractiveEvents_ToolMessagesDisabledSuppressesToolProgressOnly
 
 	e.processInteractiveEvents(state, session, e.sessions, sessionKey, "m1", time.Now(), nil, nil, nil)
 
+	// final response with optional standalone thinking message, plus the
+	// always-on turn summary as the very last message.
 	sent := p.getSent()
-	if len(sent) < 1 || len(sent) > 2 {
-		t.Fatalf("sent = %#v, want final response with optional standalone thinking message", sent)
+	if len(sent) < 2 || len(sent) > 3 {
+		t.Fatalf("sent = %#v, want final response with optional standalone thinking message, plus turn summary", sent)
 	}
 	for _, msg := range sent {
 		if strings.Contains(msg, "Bash") || strings.Contains(msg, "echo hi") || strings.Contains(msg, "hi") {
 			t.Fatalf("tool progress should stay hidden, got %q", msg)
 		}
 	}
-	if len(sent) == 2 && !strings.Contains(sent[0], "planning") {
+	if len(sent) == 3 && !strings.Contains(sent[0], "planning") {
 		t.Fatalf("thinking message = %q, want planning", sent[0])
 	}
-	if sent[len(sent)-1] != "done" {
-		t.Fatalf("final message = %q, want done", sent[len(sent)-1])
+	if sent[len(sent)-2] != "done" {
+		t.Fatalf("final message = %q, want done", sent[len(sent)-2])
 	}
 }
 
@@ -1598,9 +1298,10 @@ func TestProcessInteractiveEvents_CompactProgressCoalescesThinkingAndToolUse(t *
 
 	e.processInteractiveEvents(state, session, e.sessions, sessionKey, "m1", time.Now(), nil, nil, state.replyCtx)
 
+	// Final assistant reply plus the always-on turn summary.
 	sent := p.getSent()
-	if len(sent) != 1 || sent[0] != "done" {
-		t.Fatalf("sent = %#v, want only final assistant reply", sent)
+	if len(sent) != 2 || sent[0] != "done" {
+		t.Fatalf("sent = %#v, want final assistant reply plus turn summary", sent)
 	}
 
 	starts := p.getPreviewStarts()
@@ -1643,9 +1344,10 @@ func TestProcessInteractiveEvents_CardProgressUsesCardTemplate(t *testing.T) {
 
 	e.processInteractiveEvents(state, session, e.sessions, sessionKey, "m2", time.Now(), nil, nil, state.replyCtx)
 
+	// Final assistant reply plus the always-on turn summary.
 	sent := p.getSent()
-	if len(sent) != 1 || sent[0] != "done" {
-		t.Fatalf("sent = %#v, want only final assistant reply", sent)
+	if len(sent) != 2 || sent[0] != "done" {
+		t.Fatalf("sent = %#v, want final assistant reply plus turn summary", sent)
 	}
 
 	starts := p.getPreviewStarts()
@@ -1705,9 +1407,10 @@ func TestProcessInteractiveEvents_FinalReplyUsesWorkspaceForReferenceRendering(t
 
 	e.processInteractiveEvents(state, session, e.sessions, sessionKey, "m-relative", time.Now(), nil, nil, state.replyCtx)
 
+	// Final reply plus the always-on turn summary.
 	sent := p.getSent()
-	if len(sent) != 1 {
-		t.Fatalf("sent = %#v, want one final reply", sent)
+	if len(sent) != 2 {
+		t.Fatalf("sent = %#v, want one final reply plus turn summary", sent)
 	}
 	if got := sent[0]; got != "📄 `demo-repo/src/services/user_profile_service.ts:42`" {
 		t.Fatalf("final reply = %q, want workspace-relative rendered reference", got)
@@ -1746,9 +1449,10 @@ func TestProcessInteractiveEvents_FinalReplyRemainsRawWhenReferencesDisabled(t *
 
 	e.processInteractiveEvents(state, session, e.sessions, sessionKey, "m-relative-raw", time.Now(), nil, nil, state.replyCtx)
 
+	// Final reply plus the always-on turn summary.
 	sent := p.getSent()
-	if len(sent) != 1 {
-		t.Fatalf("sent = %#v, want one final reply", sent)
+	if len(sent) != 2 {
+		t.Fatalf("sent = %#v, want one final reply plus turn summary", sent)
 	}
 	if got := sent[0]; got != raw {
 		t.Fatalf("final reply = %q, want raw unchanged content %q", got, raw)
@@ -3308,7 +3012,7 @@ func TestHandleMessage_AutoResetOnIdle_RotatesToNewSession(t *testing.T) {
 	for {
 		active := e.sessions.GetOrCreateActive(key)
 		sent := p.getSent()
-		if active.ID != old.ID && len(active.GetHistory(0)) >= 2 && len(sent) >= 2 {
+		if active.ID != old.ID && len(active.GetHistory(0)) >= 2 && len(sent) >= 3 {
 			break
 		}
 		select {
@@ -3344,11 +3048,12 @@ func TestHandleMessage_AutoResetOnIdle_RotatesToNewSession(t *testing.T) {
 		t.Fatalf("unexpected second history entry: %#v", history[1])
 	}
 
+	// Auto-reset notice, fresh reply, then the always-on turn summary.
 	sent := p.getSent()
 	if !strings.Contains(sent[0], "Session auto-reset") {
 		t.Fatalf("first reply = %q, want auto-reset notice", sent[0])
 	}
-	if got := sent[len(sent)-1]; got != "fresh reply" {
+	if got := sent[len(sent)-2]; got != "fresh reply" {
 		t.Fatalf("final reply = %q, want fresh reply", got)
 	}
 }
@@ -12875,9 +12580,10 @@ func TestExecuteCronJob_ResolvesCronReplyTarget(t *testing.T) {
 		t.Fatalf("ResolveCronReplyTarget title = %q, want Daily summary", platform.resolveTitle)
 	}
 
+	// Cron start notice, final result, plus the always-on turn summary.
 	sent := platform.getSent()
-	if len(sent) != 2 {
-		t.Fatalf("sent messages = %d, want 2", len(sent))
+	if len(sent) != 3 {
+		t.Fatalf("sent messages = %d, want 3", len(sent))
 	}
 	if sent[0] != "⏰ Daily summary" {
 		t.Fatalf("sent[0] = %q, want cron start notice", sent[0])
@@ -13243,7 +12949,7 @@ func TestHandleMessage_InstantReply_SkippedWhenDisabled(t *testing.T) {
 	deadline := time.After(2 * time.Second)
 	for {
 		sent := p.getSent()
-		if len(sent) >= 1 {
+		if len(sent) >= 2 {
 			break
 		}
 		select {
@@ -13255,9 +12961,9 @@ func TestHandleMessage_InstantReply_SkippedWhenDisabled(t *testing.T) {
 	}
 
 	sent := p.getSent()
-	// The only reply should be the agent result, no instant reply
-	if len(sent) != 1 {
-		t.Fatalf("sent messages = %d, want exactly 1 (no instant reply), got: %v", len(sent), sent)
+	// The agent result plus the always-on turn summary; no instant reply.
+	if len(sent) != 2 {
+		t.Fatalf("sent messages = %d, want exactly 2 (agent reply + turn summary, no instant reply), got: %v", len(sent), sent)
 	}
 	if sent[0] != "agent reply" {
 		t.Fatalf("first reply = %q, want 'agent reply'", sent[0])

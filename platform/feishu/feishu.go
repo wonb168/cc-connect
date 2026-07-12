@@ -2698,34 +2698,6 @@ func (p *Platform) Send(ctx context.Context, rctx any, content string) error {
 	return p.sendNewMessageToChat(ctx, rc, msgType, msgBody)
 }
 
-// SendWithStatusFooter implements core.StatusFooterSender: send a reply with
-// the body content followed by a small/dim status-footer block. Always uses
-// the interactive card path so the footer can render with text_size:
-// "notation". Falls back to plain Send when the footer is empty or the content
-// contains a resolved @mention (Feishu only fires mention events for <at> tags
-// inside MsgTypeText, not inside cards).
-func (p *Platform) SendWithStatusFooter(ctx context.Context, rctx any, content, footer string) error {
-	rc, ok := rctx.(replyContext)
-	if !ok {
-		return fmt.Errorf("%s: invalid reply context type %T", p.tag(), rctx)
-	}
-	// Resolve mentions first so we can detect whether a real @mention is
-	content = p.resolveMentionsInContent(ctx, rc.chatID, content)
-	if strings.TrimSpace(footer) == "" || strings.Contains(content, `<at user_id=`) || strings.Contains(content, `<at id=`) {
-		if strings.TrimSpace(footer) != "" {
-			content += "\n\n" + footer
-		}
-		return p.Send(ctx, rctx, content)
-	}
-	processedBody := sanitizeMarkdownURLs(preprocessFeishuMarkdown(content))
-	processedFooter := sanitizeMarkdownURLs(preprocessFeishuMarkdown(footer))
-	cardJSON := buildCardJSONWithStatusFooter(processedBody, processedFooter)
-	if p.shouldUseThreadOrReplyAPI(rc) {
-		return p.replyMessage(ctx, rc, larkim.MsgTypeInteractive, cardJSON)
-	}
-	return p.sendNewMessageToChat(ctx, rc, larkim.MsgTypeInteractive, cardJSON)
-}
-
 func (p *Platform) SendImage(ctx context.Context, rctx any, img core.ImageAttachment) error {
 	rc, ok := rctx.(replyContext)
 	if !ok {
@@ -3713,43 +3685,6 @@ func buildCardJSON(content string) string {
 	return string(b)
 }
 
-// buildCardJSONWithStatusFooter builds an interactive card with a body
-// markdown element followed by a small/dim status-footer markdown element
-// (Lark `text_size: "notation"`). Empty footer falls through to buildCardJSON.
-func buildCardJSONWithStatusFooter(content, footer string) string {
-	if strings.TrimSpace(footer) == "" {
-		return buildCardJSON(content)
-	}
-	segments := sanitizeCardMarkdownSegmentsForCard([]string{content, footer})
-	content = segments[0]
-	footer = segments[1]
-	elements := []map[string]any{
-		{
-			"tag":     "markdown",
-			"content": content,
-		},
-		{
-			"tag": "hr",
-		},
-		{
-			"tag":       "markdown",
-			"content":   footer,
-			"text_size": "notation",
-		},
-	}
-	card := map[string]any{
-		"schema": "2.0",
-		"config": map[string]any{
-			"wide_screen_mode": true,
-		},
-		"body": map[string]any{
-			"elements": elements,
-		},
-	}
-	b, _ := json.Marshal(card)
-	return string(b)
-}
-
 func isZhLikeProgressLang(lang string) bool {
 	l := strings.ToLower(strings.TrimSpace(lang))
 	return strings.HasPrefix(l, "zh")
@@ -4467,37 +4402,6 @@ func (p *Platform) UpdateMessage(ctx context.Context, previewHandle any, content
 	// Route card-entity-bound messages to cardkit-v1 full-card update API.
 	// Im.Message.Patch on entity-referenced messages is silently no-op for the
 	// card body / header — only inline card JSON messages can be patched that way.
-	h.mu.Lock()
-	cardID := h.cardID
-	h.mu.Unlock()
-	if cardID != "" {
-		return p.updateCardEntity(ctx, h, cardJSON)
-	}
-	return p.patchCardMessage(ctx, h.messageID, cardJSON)
-}
-
-// UpdateMessageWithStatusFooter implements core.StatusFooterUpdater: edit an
-// existing card to render the body markdown plus a small/dim status-footer
-// block (Lark `text_size: "notation"`). Falls through to UpdateMessage when
-// the footer is empty.
-func (p *Platform) UpdateMessageWithStatusFooter(ctx context.Context, previewHandle any, content, footer string) error {
-	if !p.useInteractiveCard {
-		return core.ErrNotSupported
-	}
-	if strings.TrimSpace(footer) == "" {
-		return p.UpdateMessage(ctx, previewHandle, content)
-	}
-	h, ok := previewHandle.(*feishuPreviewHandle)
-	if !ok {
-		return fmt.Errorf("%s: invalid preview handle type %T", p.tag(), previewHandle)
-	}
-	// Mirror UpdateMessage's existing behavior: it does not resolve
-	// @mentions on the card-edit path either. SendWithStatusFooter does
-	// resolve since the matching Send path resolves on the chat-thread API.
-	processedBody := sanitizeMarkdownURLs(preprocessFeishuMarkdown(content))
-	processedFooter := sanitizeMarkdownURLs(preprocessFeishuMarkdown(footer))
-	cardJSON := buildCardJSONWithStatusFooter(processedBody, processedFooter)
-	// Same card-entity routing as UpdateMessage above.
 	h.mu.Lock()
 	cardID := h.cardID
 	h.mu.Unlock()
