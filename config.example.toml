@@ -110,17 +110,24 @@ level = "info" # debug, info, warn, error
 
 # [display]
 # mode = "full"             # Display mode: "full" (default), "compact", or "quiet"
-#                           # full: show thinking + tool messages as separate messages
-#                           #       显示思考和工具消息，每条单独发送
-#                           # compact: hide thinking/tool, each text segment sent separately
-#                           #          隐藏思考和工具消息，每段文本独立发送
+#                           # full: thinking/tool content is logged to the app log only;
+#                           #       chat shows a ticking elapsed-time indicator instead
+#                           #       思考和工具调用内容仅记录到应用日志；聊天中只显示
+#                           #       跳动的已运行时间指示器
+#                           # compact: same as full for chat (no thinking/tool content
+#                           #          shown), but each text segment is sent as its own
+#                           #          separate message instead of one ticking card
+#                           #          聊天中同样不展示思考/工具内容，但每段文本作为
+#                           #          独立消息单独发送，而不是同一张跳动卡片
 #                           # quiet: hide thinking/tool, all text in one card, done emoji at end
 #                           #        隐藏思考和工具消息，所有文本合并到同一张卡片，完成后发送 done emoji
-# thinking_messages = true  # Show/hide thinking messages (default: true) / 是否显示思考消息（默认 true）
-# thinking_max_len = 300    # Max chars for thinking messages (default: 300) / 思考消息最大字符数（默认 300）
-# tool_max_len = 500        # Max chars for tool use messages (default: 500) / 工具调用消息最大字符数（默认 500）
+# thinking_messages = true  # Log thinking content to the app log instead of chat (default: true)
+#                           # 将思考内容记录到应用日志而非聊天（默认 true）
+# thinking_max_len = 300    # Max chars for logged thinking content (default: 300) / 记录的思考内容最大字符数（默认 300）
+# tool_max_len = 500        # Max chars for logged tool use/result content (default: 500) / 记录的工具调用/结果内容最大字符数（默认 500）
 # history_max_len = 1000    # Max chars per /history entry (default: 1000; 0 = no truncation) / 每条历史记录最大字符数（默认 1000；0 表示不截断）
-# tool_messages = true      # Show/hide tool progress messages (default: true) / 是否显示工具进度消息（默认 true）
+# tool_messages = true      # Log tool call/result content to the app log instead of chat (default: true)
+#                           # 将工具调用/结果内容记录到应用日志而非聊天（默认 true）
 # show_context_indicator = true  # Show "[ctx: ~N%]" suffix on assistant replies (default: true)
 #                                # 在助手回复末尾显示「[ctx: ~N%]」上下文占用提示（默认 true 显示）
 # reply_footer = true            # Show Codex-like footer on assistant replies (default: true)

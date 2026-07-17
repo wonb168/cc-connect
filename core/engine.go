@@ -378,18 +378,19 @@ type Engine struct {
 	userRoles    *UserRoleManager // nil = legacy mode (no per-user policies)
 	userRolesMu  sync.RWMutex     // protects userRoles, disabledCmds, and adminFrom
 
-	rateLimiter       *RateLimiter
-	outgoingRL        *OutgoingRateLimiter
-	streamPreview     StreamPreviewCfg
-	instantReply      InstantReplyCfg
-	references        ReferenceRenderCfg
-	relayManager      *RelayManager
-	eventIdleTimeout  time.Duration
-	maxTurnTime       time.Duration // absolute wall-clock cap per turn (0 = disabled)
-	maxQueuedMessages int
-	dirHistory        *DirHistory
-	baseWorkDir       string
-	projectState      *ProjectStateStore
+	rateLimiter             *RateLimiter
+	outgoingRL              *OutgoingRateLimiter
+	streamPreview           StreamPreviewCfg
+	instantReply            InstantReplyCfg
+	references              ReferenceRenderCfg
+	relayManager            *RelayManager
+	eventIdleTimeout        time.Duration
+	maxTurnTime             time.Duration // absolute wall-clock cap per turn (0 = disabled)
+	quietStatusTickInterval time.Duration // periodic elapsed-time refresh in quiet display mode
+	maxQueuedMessages       int
+	dirHistory              *DirHistory
+	baseWorkDir             string
+	projectState            *ProjectStateStore
 
 	// Auto-compress settings
 	autoCompressEnabled   bool
@@ -712,31 +713,32 @@ func (pp *pendingPermission) resolve() {
 func NewEngine(name string, ag Agent, platforms []Platform, sessionStorePath string, lang Language) *Engine {
 	ctx, cancel := context.WithCancel(context.Background())
 	e := &Engine{
-		name:                  name,
-		agent:                 ag,
-		platforms:             platforms,
-		sessions:              NewSessionManager(sessionStorePath),
-		ctx:                   ctx,
-		cancel:                cancel,
-		i18n:                  NewI18n(lang),
-		attachmentSendEnabled: true,
-		display:               DisplayCfg{Mode: "full", ThinkingMessages: true, ThinkingMaxLen: defaultThinkingMaxLen, ToolMaxLen: defaultToolMaxLen, ToolMessages: true, CardMode: "legacy"},
-		commands:              NewCommandRegistry(),
-		skills:                NewSkillRegistry(),
-		aliases:               make(map[string]string),
-		interactiveStates:     make(map[string]*interactiveState),
-		sendWorkDirs:          make(map[string]string),
-		platformReady:         make(map[Platform]bool),
-		startedAt:             time.Now(),
-		streamPreview:         DefaultStreamPreviewCfg(),
-		references:            DefaultReferenceRenderCfg(),
-		eventIdleTimeout:      defaultEventIdleTimeout,
-		maxQueuedMessages:     defaultMaxQueuedMessages,
-		showContextIndicator:  true,
-		showWorkdirIndicator:  true,
-		shell:                 defaultShell(),
-		shellFlag:             defaultShellFlag(),
-		pendingRestartTimeout: defaultPendingRestartTimeout,
+		name:                    name,
+		agent:                   ag,
+		platforms:               platforms,
+		sessions:                NewSessionManager(sessionStorePath),
+		ctx:                     ctx,
+		cancel:                  cancel,
+		i18n:                    NewI18n(lang),
+		attachmentSendEnabled:   true,
+		display:                 DisplayCfg{Mode: "full", ThinkingMessages: true, ThinkingMaxLen: defaultThinkingMaxLen, ToolMaxLen: defaultToolMaxLen, ToolMessages: true, CardMode: "legacy"},
+		commands:                NewCommandRegistry(),
+		skills:                  NewSkillRegistry(),
+		aliases:                 make(map[string]string),
+		interactiveStates:       make(map[string]*interactiveState),
+		sendWorkDirs:            make(map[string]string),
+		platformReady:           make(map[Platform]bool),
+		startedAt:               time.Now(),
+		streamPreview:           DefaultStreamPreviewCfg(),
+		references:              DefaultReferenceRenderCfg(),
+		eventIdleTimeout:        defaultEventIdleTimeout,
+		quietStatusTickInterval: defaultQuietStatusTickInterval,
+		maxQueuedMessages:       defaultMaxQueuedMessages,
+		showContextIndicator:    true,
+		showWorkdirIndicator:    true,
+		shell:                   defaultShell(),
+		shellFlag:               defaultShellFlag(),
+		pendingRestartTimeout:   defaultPendingRestartTimeout,
 	}
 
 	if ag != nil {
@@ -1288,6 +1290,14 @@ func (e *Engine) SetMaxTurnTime(d time.Duration) {
 // 0 disables the timeout entirely.
 func (e *Engine) SetEventIdleTimeout(d time.Duration) {
 	e.eventIdleTimeout = d
+}
+
+// SetQuietStatusTickInterval overrides how often the quiet-mode status line
+// refreshes its elapsed-time display. 0 disables the periodic refresh (the
+// status still updates on thinking/tool events, just not between them).
+// Exposed primarily so tests can use a short interval.
+func (e *Engine) SetQuietStatusTickInterval(d time.Duration) {
+	e.quietStatusTickInterval = d
 }
 
 // SetMaxQueuedMessages sets the per-session message queue depth.
@@ -4222,6 +4232,11 @@ func (e *Engine) closeAgentSessionWithTimeout(sessionKey string, agentSession Ag
 
 const defaultEventIdleTimeout = 2 * time.Hour
 
+// defaultQuietStatusTickInterval is how often the quiet-mode elapsed-time
+// status line refreshes while a turn is running, so long gaps between
+// thinking/tool events still show a visibly changing "still alive" signal.
+const defaultQuietStatusTickInterval = 5 * time.Second
+
 // cardToolEntry stores a tool call record for card content rendering.
 type cardToolEntry struct {
 	Index int
@@ -4557,24 +4572,15 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 	var lastRichCardLen int
 	var cardMessageID any
 	var partialText string
-	var richCardTitle string    // transient title shown while tool calls run; cleared on first answer text
-	var quietStatusThinking bool // whether thinking event seen this turn
-	var quietToolCount int       // tool calls seen this turn (for quiet status line)
+	var richCardTitle string // transient title shown while processing; cleared on first answer text
+	var answerStarted bool   // true once the first non-silent answer text chunk has arrived
 
-	// buildQuietStatus composes the transient one-liner shown during processing.
-	// Format: "💭 思考中…  🔧 #1  🔧 #2 …"
+	// buildQuietStatus composes the transient status line shown while the
+	// turn is running. Quiet mode intentionally reveals nothing about
+	// thinking content or tool calls — it only proves the turn is still
+	// alive via an elapsed-time value that visibly changes every tick.
 	buildQuietStatus := func() string {
-		s := ""
-		if quietStatusThinking {
-			s = "💭 思考中…"
-		}
-		for i := 1; i <= quietToolCount; i++ {
-			if s != "" {
-				s += "  "
-			}
-			s += fmt.Sprintf("🔧 #%d", i)
-		}
-		return s
+		return e.i18n.Tf(MsgQuietElapsed, formatElapsedShort(time.Since(turnStart)))
 	}
 	triggerAutoCompress := false
 	pendingSend := sendDone
@@ -4612,9 +4618,8 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 
 	// Streaming card: aggregate entire turn into a single updatable card.
 	var streamCard StreamingCard
-	var cardToolCalls []cardToolEntry  // track tool calls for card content
-	var cardThinkingText string        // latest thinking text
 	var cardAnswerText strings.Builder // accumulated answer text
+	var cardStatusLine string          // transient elapsed-time status line, cleared once answer starts
 
 	if scp, ok := state.platform.(StreamingCardPlatform); ok {
 		if sc, err := scp.CreateStreamingCard(e.ctx, state.replyCtx); err != nil {
@@ -4655,6 +4660,20 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 		turnDeadlineTimer := time.NewTimer(e.maxTurnTime)
 		defer turnDeadlineTimer.Stop()
 		turnDeadlineCh = turnDeadlineTimer.C
+	}
+
+	// Status ticker: refreshes the elapsed-time indicator even when no
+	// thinking/tool events arrive for a while, so a long-running single tool
+	// call doesn't look frozen. Runs in quiet display mode (content hidden)
+	// and whenever thinking/tool detail is being logged instead of shown in
+	// chat (ThinkingMessages/ToolMessages true, i.e. full mode). Does not run
+	// in compact mode, which uses freeze+detach text splitting instead.
+	var quietTicker *time.Ticker
+	var quietTickCh <-chan time.Time
+	if (e.display.Mode == "quiet" || e.display.ThinkingMessages || e.display.ToolMessages) && e.quietStatusTickInterval > 0 {
+		quietTicker = time.NewTicker(e.quietStatusTickInterval)
+		defer quietTicker.Stop()
+		quietTickCh = quietTicker.C
 	}
 
 	events := state.agentSession.Events()
@@ -4756,6 +4775,34 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			state.eventsNeedResync = true
 			state.mu.Unlock()
 			return
+		case <-quietTickCh:
+			// Periodic elapsed-time refresh so a long gap between events
+			// (e.g. one slow tool call) doesn't look like the turn froze.
+			// Skipped once real answer text has started arriving.
+			if !answerStarted {
+				state.mu.Lock()
+				p := state.platform
+				state.mu.Unlock()
+				richCardSupporter, hasRichCard := p.(RichCardSupporter)
+				if e.display.CardMode != "rich" {
+					hasRichCard = false
+				}
+				richCardTitle = buildQuietStatus()
+				if hasRichCard {
+					if cardMessageID != nil {
+						if updater, ok := p.(MessageUpdater); ok {
+							card := richCardSupporter.BuildRichCard(CardStatusWorking, richCardTitle, toolSteps, partialText, true, "")
+							_ = updater.UpdateMessage(e.ctx, cardMessageID, card)
+						}
+					}
+				} else if streamCard != nil && !streamCard.Failed() {
+					cardStatusLine = richCardTitle
+					_ = streamCard.Update(e.ctx, cardStatusLine+"\n\n"+buildCardContent("", nil, cardAnswerText.String()))
+				} else if sp.canPreview() {
+					sp.setToolStatus(richCardTitle)
+				}
+			}
+			continue
 		}
 
 		if state.isStopped() {
@@ -4813,75 +4860,51 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			if isEllipsisOnly(event.Content) {
 				break
 			}
+			if e.display.ThinkingMessages && event.Content != "" {
+				slog.Info("agent thinking", "session_key", sessionKey, "content", truncateIf(event.Content, e.display.ThinkingMaxLen))
+			}
 			if hasRichCard {
-				// When thinking messages are suppressed, show transient title in the rich card.
-				if !e.display.ThinkingMessages {
-					if e.display.Mode == "quiet" {
-						quietStatusThinking = true
-						richCardTitle = buildQuietStatus()
-						if cardMessageID == nil {
-							card := buildResolvedRichCard(CardStatusThinking, richCardTitle, nil, "", true, "")
-							if starter, ok := p.(PreviewStarter); ok {
-								handle, err := starter.SendPreviewStart(e.ctx, replyCtx, card)
-								if err != nil {
-									slog.Debug("rich card: failed to create thinking-status card", "error", err)
-								} else {
-									cardMessageID = handle
-								}
+				// Thinking content is never shown in chat — only an elapsed-time
+				// status line, whether ThinkingMessages is suppressing it (quiet
+				// mode) or logging it instead (full mode).
+				if e.display.Mode == "quiet" || e.display.ThinkingMessages {
+					richCardTitle = buildQuietStatus()
+					if cardMessageID == nil {
+						card := buildResolvedRichCard(CardStatusThinking, richCardTitle, nil, "", true, "")
+						if starter, ok := p.(PreviewStarter); ok {
+							handle, err := starter.SendPreviewStart(e.ctx, replyCtx, card)
+							if err != nil {
+								slog.Debug("rich card: failed to create thinking-status card", "error", err)
+							} else {
+								cardMessageID = handle
 							}
-						} else if updater, ok := p.(MessageUpdater); ok {
-							card := buildResolvedRichCard(CardStatusThinking, richCardTitle, nil, partialText, true, "")
-							_ = updater.UpdateMessage(e.ctx, cardMessageID, card)
 						}
-					}
-					break
-				}
-				if thinking := strings.TrimSpace(truncateIf(event.Content, e.display.ThinkingMaxLen)); thinking != "" {
-					toolSteps = append(toolSteps, ToolStep{
-						Kind:    ToolStepKindThinking,
-						Name:    "Thinking",
-						Summary: thinking,
-						Done:    true,
-					})
-				}
-				if cardMessageID == nil {
-					card := buildResolvedRichCard(CardStatusThinking, "", toolSteps, partialText, true, "")
-					if starter, ok := p.(PreviewStarter); ok {
-						handle, err := starter.SendPreviewStart(e.ctx, replyCtx, card)
-						if err != nil {
-							slog.Debug("rich card: failed to create initial thinking card", "platform", p.Name(), "error", err)
-						} else {
-							cardMessageID = handle
-						}
-					}
-				} else if updater, ok := p.(MessageUpdater); ok {
-					card := buildResolvedRichCard(CardStatusThinking, "", toolSteps, partialText, true, "")
-					if err := updater.UpdateMessage(e.ctx, cardMessageID, card); err != nil {
-						slog.Debug("rich card: failed to update thinking card", "platform", p.Name(), "error", err)
+					} else if updater, ok := p.(MessageUpdater); ok {
+						card := buildResolvedRichCard(CardStatusThinking, richCardTitle, nil, partialText, true, "")
+						_ = updater.UpdateMessage(e.ctx, cardMessageID, card)
 					}
 				}
 				break
 			}
-			// When thinking messages are hidden, behavior depends on display mode:
-			//   quiet:   show thinking excerpt (persistent) + tool status in preview card
-			//   compact: freeze+detach to split text into separate cards
-			if !e.display.ThinkingMessages {
-				if e.display.Mode == "quiet" && sp.canPreview() {
-					quietStatusThinking = true
-					// Build thinking excerpt: first 150 runes of content
-					thinkingExcerpt := event.Content
-					runes := []rune(thinkingExcerpt)
-					if len(runes) > 150 {
-						thinkingExcerpt = string(runes[:150]) + "…"
-					}
-					thinkingExcerpt = strings.TrimSpace(thinkingExcerpt)
-					if thinkingExcerpt != "" {
-						sp.setThinkingStatus("💭 " + thinkingExcerpt)
-					}
+			// StreamingCard path (DingTalk/Slack): show only the elapsed-time
+			// status line, never the thinking content itself.
+			if streamCard != nil && !streamCard.Failed() {
+				if !answerStarted {
+					cardStatusLine = buildQuietStatus()
+					_ = streamCard.Update(e.ctx, cardStatusLine+"\n\n"+buildCardContent("", nil, cardAnswerText.String()))
+				}
+				continue // skip original independent message sending
+			}
+			// Legacy fallback: behavior depends on display mode.
+			//   quiet/full: show elapsed-time status (no thinking content) in preview card
+			//   compact:    freeze+detach to split text into separate cards
+			if e.display.Mode == "quiet" || e.display.ThinkingMessages {
+				if sp.canPreview() {
+					sp.setToolStatus(buildQuietStatus())
 				}
 			}
-			if !e.display.ThinkingMessages && len(textParts) > segmentStart {
-				if e.display.Mode == "quiet" {
+			if len(textParts) > segmentStart {
+				if e.display.Mode == "quiet" || e.display.ThinkingMessages {
 					if sp.canPreview() && sp.appendSeparator("\n\n") {
 						textParts = append(textParts, "\n\n")
 					}
@@ -4900,99 +4923,55 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 					segmentStart = len(textParts)
 				}
 				silentHold = false
-			}
-			if e.display.ThinkingMessages && event.Content != "" {
-				// --- StreamingCard path ---
-				if streamCard != nil && !streamCard.Failed() {
-					cardThinkingText = truncateIf(event.Content, e.display.ThinkingMaxLen)
-					_ = streamCard.Update(e.ctx, buildCardContent(cardThinkingText, cardToolCalls, cardAnswerText.String()))
-					continue // skip original independent message sending
-				}
-				// --- Original path (fallback) ---
-				// Flush accumulated text segment before thinking display
-				previewActive := sp.canPreview()
-				if len(textParts) > segmentStart {
-					if !previewActive {
-						segment := strings.Join(textParts[segmentStart:], "")
-						if segment != "" {
-							for _, chunk := range splitMessage(segment, maxPlatformMessageLen) {
-								sendWorkspace(p, replyCtx, chunk)
-							}
-						}
-					}
-					segmentStart = len(textParts)
-					silentHold = false
-				}
-				sp.freeze()
-				if previewActive {
-					sp.detachPreview() // keep frozen preview visible as permanent message
-				}
-				preview := truncateIf(event.Content, e.display.ThinkingMaxLen)
-				thinkingMsg := fmt.Sprintf(e.i18n.T(MsgThinking), preview)
-				if !cp.AppendEvent(ProgressEntryThinking, preview, "", thinkingMsg) {
-					sendWorkspace(p, replyCtx, thinkingMsg)
-				}
 			}
 
 		case EventToolUse:
 			toolCount++
+			if e.display.ToolMessages {
+				slog.Info("agent tool use", "session_key", sessionKey, "tool", event.ToolName, "input", truncateIf(event.ToolInput, e.display.ToolMaxLen))
+			}
 			if hasRichCard {
-				// When tool messages are suppressed, show transient tool count in the rich card.
-				if !e.display.ToolMessages {
-					if e.display.Mode == "quiet" {
-						quietToolCount++
-						richCardTitle = buildQuietStatus()
-						if cardMessageID == nil {
-							card := buildResolvedRichCard(CardStatusWorking, richCardTitle, nil, "", true, "")
-							if starter, ok := p.(PreviewStarter); ok {
-								handle, err := starter.SendPreviewStart(e.ctx, replyCtx, card)
-								if err != nil {
-									slog.Debug("rich card: failed to create tool-status card", "error", err)
-								} else {
-									cardMessageID = handle
-								}
+				// Tool calls are never shown in chat — only an elapsed-time
+				// status line, whether ToolMessages is suppressing them (quiet
+				// mode) or logging them instead (full mode).
+				if e.display.Mode == "quiet" || e.display.ToolMessages {
+					richCardTitle = buildQuietStatus()
+					if cardMessageID == nil {
+						card := buildResolvedRichCard(CardStatusWorking, richCardTitle, nil, "", true, "")
+						if starter, ok := p.(PreviewStarter); ok {
+							handle, err := starter.SendPreviewStart(e.ctx, replyCtx, card)
+							if err != nil {
+								slog.Debug("rich card: failed to create tool-status card", "error", err)
+							} else {
+								cardMessageID = handle
 							}
-						} else if updater, ok := p.(MessageUpdater); ok {
-							card := buildResolvedRichCard(CardStatusWorking, richCardTitle, nil, partialText, true, "")
-							_ = updater.UpdateMessage(e.ctx, cardMessageID, card)
 						}
-					}
-					break
-				}
-				toolSteps = append(toolSteps, ToolStep{
-					Kind:    ToolStepKindTool,
-					Name:    event.ToolName,
-					Summary: truncateIf(event.ToolInput, e.display.ToolMaxLen),
-				})
-				if cardMessageID == nil {
-					card := buildResolvedRichCard(CardStatusWorking, "", toolSteps, partialText, true, "")
-					if starter, ok := p.(PreviewStarter); ok {
-						handle, err := starter.SendPreviewStart(e.ctx, replyCtx, card)
-						if err != nil {
-							slog.Debug("rich card: failed to create initial tool card", "platform", p.Name(), "error", err)
-						} else {
-							cardMessageID = handle
-						}
-					}
-				} else if updater, ok := p.(MessageUpdater); ok {
-					card := buildResolvedRichCard(CardStatusWorking, "", toolSteps, partialText, true, "")
-					if err := updater.UpdateMessage(e.ctx, cardMessageID, card); err != nil {
-						slog.Debug("rich card: failed to update tool card", "platform", p.Name(), "error", err)
+					} else if updater, ok := p.(MessageUpdater); ok {
+						card := buildResolvedRichCard(CardStatusWorking, richCardTitle, nil, partialText, true, "")
+						_ = updater.UpdateMessage(e.ctx, cardMessageID, card)
 					}
 				}
 				break
 			}
-			// When tool messages are hidden, behavior depends on display mode:
-			//   quiet:   show transient tool status in preview, cleared when answer arrives
-			//   compact: freeze+detach to split text into separate cards
-			if !e.display.ToolMessages {
-				if e.display.Mode == "quiet" && sp.canPreview() {
-					quietToolCount++
+			// StreamingCard path (DingTalk/Slack): show only the elapsed-time
+			// status line, never the tool call itself.
+			if streamCard != nil && !streamCard.Failed() {
+				if !answerStarted {
+					cardStatusLine = buildQuietStatus()
+					_ = streamCard.Update(e.ctx, cardStatusLine+"\n\n"+buildCardContent("", nil, cardAnswerText.String()))
+				}
+				continue // skip original independent message sending
+			}
+			// Legacy fallback: behavior depends on display mode.
+			//   quiet/full: show elapsed-time status (no tool content) in preview card
+			//   compact:    freeze+detach to split text into separate cards
+			if e.display.Mode == "quiet" || e.display.ToolMessages {
+				if sp.canPreview() {
 					sp.setToolStatus(buildQuietStatus())
 				}
 			}
-			if !e.display.ToolMessages && len(textParts) > segmentStart {
-				if e.display.Mode == "quiet" {
+			if len(textParts) > segmentStart {
+				if e.display.Mode == "quiet" || e.display.ToolMessages {
 					if sp.canPreview() && sp.appendSeparator("\n\n") {
 						textParts = append(textParts, "\n\n")
 					}
@@ -5011,77 +4990,6 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 					segmentStart = len(textParts)
 				}
 				silentHold = false
-			}
-			if e.display.ToolMessages {
-				// --- StreamingCard path ---
-				if streamCard != nil && !streamCard.Failed() {
-					toolInput := event.ToolInput
-					var formattedInput string
-					if toolInput == "" {
-						formattedInput = ""
-					} else if strings.Contains(toolInput, "```") {
-						formattedInput = toolInput
-					} else if strings.Contains(toolInput, "\n") || utf8.RuneCountInString(toolInput) > 200 {
-						lang := toolCodeLang(event.ToolName, toolInput)
-						formattedInput = fmt.Sprintf("```%s\n%s\n```", lang, toolInput)
-					} else {
-						switch event.ToolName {
-						case "shell", "run_shell_command", "Bash":
-							formattedInput = fmt.Sprintf("```bash\n%s\n```", toolInput)
-						default:
-							formattedInput = fmt.Sprintf("`%s`", toolInput)
-						}
-					}
-					cardToolCalls = append(cardToolCalls, cardToolEntry{
-						Index: toolCount,
-						Name:  event.ToolName,
-						Input: formattedInput,
-					})
-					_ = streamCard.Update(e.ctx, buildCardContent(cardThinkingText, cardToolCalls, cardAnswerText.String()))
-					continue // skip original independent message sending
-				}
-				// --- Original path (fallback) ---
-				// Flush accumulated text segment before tool display
-				previewActive := sp.canPreview()
-				if len(textParts) > segmentStart {
-					if !previewActive {
-						segment := strings.Join(textParts[segmentStart:], "")
-						if segment != "" {
-							for _, chunk := range splitMessage(segment, maxPlatformMessageLen) {
-								sendWorkspace(p, replyCtx, chunk)
-							}
-						}
-					}
-					segmentStart = len(textParts)
-					silentHold = false
-				}
-				sp.freeze()
-				if previewActive {
-					sp.detachPreview() // keep frozen preview visible as permanent message
-				}
-				toolInput := event.ToolInput
-				var formattedInput string
-				if toolInput == "" {
-					formattedInput = ""
-				} else if strings.Contains(toolInput, "```") {
-					formattedInput = toolInput
-				} else if strings.Contains(toolInput, "\n") || utf8.RuneCountInString(toolInput) > 200 {
-					lang := toolCodeLang(event.ToolName, toolInput)
-					formattedInput = fmt.Sprintf("```%s\n%s\n```", lang, toolInput)
-				} else {
-					switch event.ToolName {
-					case "shell", "run_shell_command", "Bash":
-						formattedInput = fmt.Sprintf("```bash\n%s\n```", toolInput)
-					default:
-						formattedInput = fmt.Sprintf("`%s`", toolInput)
-					}
-				}
-				toolMsg := fmt.Sprintf(e.i18n.T(MsgTool), toolCount, event.ToolName, formattedInput)
-				if !cp.AppendEvent(ProgressEntryToolUse, toolInput, event.ToolName, toolMsg) {
-					for _, chunk := range SplitMessageCodeFenceAware(toolMsg, maxPlatformMessageLen) {
-						sendWorkspace(p, replyCtx, chunk)
-					}
-				}
 			}
 
 		case EventToolResult:
@@ -5094,10 +5002,15 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 					result = truncateIf(result, e.display.ToolMaxLen)
 				}
 				if result != "" || event.ToolStatus != "" || event.ToolExitCode != nil || event.ToolSuccess != nil {
+					slog.Info("agent tool result", "session_key", sessionKey, "tool", event.ToolName,
+						"status", event.ToolStatus, "exit_code", event.ToolExitCode, "success", event.ToolSuccess,
+						"result", result)
+					// Tool results are never shown in chat — only an elapsed-time
+					// status line, matching EventThinking/EventToolUse.
 					if hasRichCard {
-						toolSteps = mergeRichToolResult(toolSteps, event, result, e.display.ToolMaxLen)
+						richCardTitle = buildQuietStatus()
 						if cardMessageID == nil {
-							card := buildResolvedRichCard(CardStatusWorking, "", toolSteps, partialText, true, "")
+							card := buildResolvedRichCard(CardStatusWorking, richCardTitle, nil, "", true, "")
 							if starter, ok := p.(PreviewStarter); ok {
 								handle, err := starter.SendPreviewStart(e.ctx, replyCtx, card)
 								if err != nil {
@@ -5107,26 +5020,22 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 								}
 							}
 						} else if updater, ok := p.(MessageUpdater); ok {
-							card := buildResolvedRichCard(CardStatusWorking, "", toolSteps, partialText, true, "")
+							card := buildResolvedRichCard(CardStatusWorking, richCardTitle, nil, partialText, true, "")
 							if err := updater.UpdateMessage(e.ctx, cardMessageID, card); err != nil {
 								slog.Debug("rich card: failed to update tool-result card", "platform", p.Name(), "error", err)
 							}
 						}
 						break
 					}
-					resultMsg := e.formatToolResultEventFallback(event.ToolName, result, event.ToolStatus, event.ToolExitCode, event.ToolSuccess)
-					entry := ProgressCardEntry{
-						Kind:     ProgressEntryToolResult,
-						Tool:     event.ToolName,
-						Text:     result,
-						Status:   event.ToolStatus,
-						ExitCode: event.ToolExitCode,
-						Success:  event.ToolSuccess,
-					}
-					if !cp.AppendStructured(entry, resultMsg) {
-						if !SuppressStandaloneToolResultEvent(p) {
-							e.sendRaw(p, replyCtx, resultMsg)
+					if streamCard != nil && !streamCard.Failed() {
+						if !answerStarted {
+							cardStatusLine = buildQuietStatus()
+							_ = streamCard.Update(e.ctx, cardStatusLine+"\n\n"+buildCardContent("", nil, cardAnswerText.String()))
 						}
+						break
+					}
+					if sp.canPreview() {
+						sp.setToolStatus(buildQuietStatus())
 					}
 				}
 			}
@@ -5144,6 +5053,9 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				prevHold := silentHold
 				silentHold = couldBeSilentPrefix(peekSegment)
 				releasedNow := prevHold && !silentHold
+				if !silentHold {
+					answerStarted = true
+				}
 
 				handledByStreamCard := false
 				if streamCard != nil && !streamCard.Failed() {
@@ -5154,7 +5066,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 						} else {
 							cardAnswerText.WriteString(event.Content)
 						}
-						_ = streamCard.Update(e.ctx, buildCardContent(cardThinkingText, cardToolCalls, cardAnswerText.String()))
+						_ = streamCard.Update(e.ctx, buildCardContent("", nil, cardAnswerText.String()))
 					}
 					handledByStreamCard = true
 				}
@@ -5521,7 +5433,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			if streamCard != nil && !streamCard.Failed() {
 				sp.finish("") // cleanup preview (should be no-op if card was active)
 				// Build final card content with full response
-				finalContent := buildCardContent(cardThinkingText, cardToolCalls, fullResponse)
+				finalContent := buildCardContent("", nil, fullResponse)
 				if err := streamCard.Finalize(e.ctx, finalContent); err != nil {
 					slog.Error("streaming card finalize failed, sending fallback", "error", err)
 					// Fallback: send the response as a normal message
@@ -5797,6 +5709,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				partialText = ""
 				lastRichCardUpdate = time.Time{}
 				lastRichCardLen = 0
+				answerStarted = false
 				queuedRenderer := func(content string) string {
 					return e.renderOutgoingContentForWorkspace(queued.platform, content, workspaceDir)
 				}
@@ -5805,8 +5718,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 
 				// Reset streaming card state for the next turn
 				streamCard = nil
-				cardToolCalls = nil
-				cardThinkingText = ""
+				cardStatusLine = ""
 				cardAnswerText.Reset()
 
 				// Try to create a new streaming card for the queued turn
@@ -8413,6 +8325,19 @@ func formatDurationI18n(d time.Duration, lang Language) string {
 		}
 		return fmt.Sprintf("%dm", minutes)
 	}
+}
+
+// formatElapsedShort renders a duration as a compact "12s" / "1m05s" string
+// for the quiet-mode status line, which needs a value that visibly changes
+// every tick rather than the day/hour granularity of formatDurationI18n.
+func formatElapsedShort(d time.Duration) string {
+	d = d.Round(time.Second)
+	minutes := int(d.Minutes())
+	seconds := int(d.Seconds()) % 60
+	if minutes > 0 {
+		return fmt.Sprintf("%dm%02ds", minutes, seconds)
+	}
+	return fmt.Sprintf("%ds", seconds)
 }
 
 func (e *Engine) cmdHistory(p Platform, msg *Message, args []string) {
@@ -14187,8 +14112,8 @@ func (e *Engine) configItems() []configItem {
 	return []configItem{
 		{
 			key:    "mode",
-			desc:   "Display mode: full, compact, quiet",
-			descZh: "显示模式: full, compact, quiet",
+			desc:   "Display mode: full, compact, quiet. In full/quiet, thinking/tool detail is logged to the app log (never shown in chat); chat shows a ticking elapsed-time indicator instead. Compact splits each text segment into its own message.",
+			descZh: "显示模式: full, compact, quiet。full/quiet 下思考与工具细节仅记录到应用日志（从不在聊天展示），聊天中显示跳动的已运行时间指示器；compact 则将每段文本作为独立消息发送。",
 			getFunc: func() string {
 				if e.display.Mode == "" {
 					return "full"
@@ -14218,8 +14143,8 @@ func (e *Engine) configItems() []configItem {
 		},
 		{
 			key:    "thinking_messages",
-			desc:   "Whether thinking messages are shown (true/false)",
-			descZh: "是否显示思考消息 (true/false)",
+			desc:   "Whether thinking content is logged to the app log (never shown in chat) (true/false)",
+			descZh: "是否将思考内容记录到应用日志（从不在聊天展示）(true/false)",
 			getFunc: func() string {
 				return fmt.Sprintf("%t", e.display.ThinkingMessages)
 			},
@@ -14237,8 +14162,8 @@ func (e *Engine) configItems() []configItem {
 		},
 		{
 			key:    "thinking_max_len",
-			desc:   "Max chars for thinking messages (0=no truncation)",
-			descZh: "思考消息最大长度 (0=不截断)",
+			desc:   "Max chars for logged thinking content (0=no truncation)",
+			descZh: "记录的思考内容最大长度 (0=不截断)",
 			getFunc: func() string {
 				return fmt.Sprintf("%d", e.display.ThinkingMaxLen)
 			},
@@ -14259,8 +14184,8 @@ func (e *Engine) configItems() []configItem {
 		},
 		{
 			key:    "tool_messages",
-			desc:   "Whether tool progress messages are shown (true/false)",
-			descZh: "是否显示工具进度消息 (true/false)",
+			desc:   "Whether tool call/result content is logged to the app log (never shown in chat) (true/false)",
+			descZh: "是否将工具调用/结果内容记录到应用日志（从不在聊天展示）(true/false)",
 			getFunc: func() string {
 				return fmt.Sprintf("%t", e.display.ToolMessages)
 			},
@@ -14278,8 +14203,8 @@ func (e *Engine) configItems() []configItem {
 		},
 		{
 			key:    "tool_max_len",
-			desc:   "Max chars for tool use messages (0=no truncation)",
-			descZh: "工具消息最大长度 (0=不截断)",
+			desc:   "Max chars for logged tool use/result content (0=no truncation)",
+			descZh: "记录的工具调用/结果内容最大长度 (0=不截断)",
 			getFunc: func() string {
 				return fmt.Sprintf("%d", e.display.ToolMaxLen)
 			},

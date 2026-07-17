@@ -160,6 +160,7 @@ type MsgKey string
 
 const (
 	MsgStarting                  MsgKey = "starting"
+	MsgQuietElapsed              MsgKey = "quiet_elapsed"
 	MsgThinking                  MsgKey = "thinking"
 	MsgTool                      MsgKey = "tool"
 	MsgToolResult                MsgKey = "tool_result"
@@ -379,31 +380,31 @@ const (
 	MsgCronIDLabel               MsgKey = "cron_id_label"
 	MsgCronFailedSuffix          MsgKey = "cron_failed_suffix"
 
-	MsgTimerNotAvailable  MsgKey = "timer_not_available"
-	MsgTimerUsage         MsgKey = "timer_usage"
-	MsgTimerAddUsage      MsgKey = "timer_add_usage"
-	MsgTimerAdded         MsgKey = "timer_added"
-	MsgTimerAddedExec     MsgKey = "timer_added_exec"
-	MsgTimerAddExecUsage  MsgKey = "timer_addexec_usage"
-	MsgTimerEmpty         MsgKey = "timer_empty"
-	MsgTimerListTitle     MsgKey = "timer_list_title"
-	MsgTimerListFooter    MsgKey = "timer_list_footer"
-	MsgTimerDelUsage      MsgKey = "timer_del_usage"
-	MsgTimerMuteUsage     MsgKey = "timer_mute_usage"
-	MsgTimerDeleted       MsgKey = "timer_deleted"
-	MsgTimerNotFound      MsgKey = "timer_not_found"
-	MsgTimerMuted         MsgKey = "timer_muted"
-	MsgTimerUnmuted       MsgKey = "timer_unmuted"
-	MsgTimerCardHint      MsgKey = "timer_card_hint"
-	MsgTimerBtnMute       MsgKey = "timer_btn_mute"
-	MsgTimerBtnUnmute     MsgKey = "timer_btn_unmute"
-	MsgTimerBtnDelete     MsgKey = "timer_btn_delete"
-	MsgTimerIDLabel       MsgKey = "timer_id_label"
-	MsgTimerScheduledLabel MsgKey = "timer_scheduled_label"
-	MsgTimerFailedSuffix  MsgKey = "timer_failed_suffix"
-	MsgCommandsTagAgent          MsgKey = "commands_tag_agent"
-	MsgCommandsTagShell          MsgKey = "commands_tag_shell"
-	MsgUpgradeTimeoutSuffix      MsgKey = "upgrade_timeout_suffix"
+	MsgTimerNotAvailable    MsgKey = "timer_not_available"
+	MsgTimerUsage           MsgKey = "timer_usage"
+	MsgTimerAddUsage        MsgKey = "timer_add_usage"
+	MsgTimerAdded           MsgKey = "timer_added"
+	MsgTimerAddedExec       MsgKey = "timer_added_exec"
+	MsgTimerAddExecUsage    MsgKey = "timer_addexec_usage"
+	MsgTimerEmpty           MsgKey = "timer_empty"
+	MsgTimerListTitle       MsgKey = "timer_list_title"
+	MsgTimerListFooter      MsgKey = "timer_list_footer"
+	MsgTimerDelUsage        MsgKey = "timer_del_usage"
+	MsgTimerMuteUsage       MsgKey = "timer_mute_usage"
+	MsgTimerDeleted         MsgKey = "timer_deleted"
+	MsgTimerNotFound        MsgKey = "timer_not_found"
+	MsgTimerMuted           MsgKey = "timer_muted"
+	MsgTimerUnmuted         MsgKey = "timer_unmuted"
+	MsgTimerCardHint        MsgKey = "timer_card_hint"
+	MsgTimerBtnMute         MsgKey = "timer_btn_mute"
+	MsgTimerBtnUnmute       MsgKey = "timer_btn_unmute"
+	MsgTimerBtnDelete       MsgKey = "timer_btn_delete"
+	MsgTimerIDLabel         MsgKey = "timer_id_label"
+	MsgTimerScheduledLabel  MsgKey = "timer_scheduled_label"
+	MsgTimerFailedSuffix    MsgKey = "timer_failed_suffix"
+	MsgCommandsTagAgent     MsgKey = "commands_tag_agent"
+	MsgCommandsTagShell     MsgKey = "commands_tag_shell"
+	MsgUpgradeTimeoutSuffix MsgKey = "upgrade_timeout_suffix"
 
 	MsgCronScheduleLabel MsgKey = "cron_schedule_label"
 	MsgCronNextRunLabel  MsgKey = "cron_next_run_label"
@@ -657,6 +658,13 @@ var messages = map[MsgKey]map[Language]string{
 		LangJapanese:           "⏳ 処理中...",
 		LangSpanish:            "⏳ Procesando...",
 	},
+	MsgQuietElapsed: {
+		LangEnglish:            "⏳ Running %s",
+		LangChinese:            "⏳ 已运行 %s",
+		LangTraditionalChinese: "⏳ 已運行 %s",
+		LangJapanese:           "⏳ 実行中 %s",
+		LangSpanish:            "⏳ Ejecutando %s",
+	},
 	MsgThinking: {
 		LangEnglish: "💭 %s",
 		LangChinese: "💭 %s",
@@ -879,11 +887,11 @@ var messages = map[MsgKey]map[Language]string{
 		LangSpanish:            "🔇 Modo silencioso activado — los mensajes de progreso se ocultarán.",
 	},
 	MsgQuietOff: {
-		LangEnglish:            "🔔 Quiet mode OFF — thinking and tool progress messages will be shown.",
-		LangChinese:            "🔔 安静模式已关闭 — 将恢复推送思考和工具调用进度消息。",
-		LangTraditionalChinese: "🔔 安靜模式已關閉 — 將恢復推送思考和工具調用進度訊息。",
-		LangJapanese:           "🔔 静音モード OFF — 思考とツール実行の進捗メッセージを表示します。",
-		LangSpanish:            "🔔 Modo silencioso desactivado — los mensajes de progreso se mostrarán.",
+		LangEnglish:            "🔔 Full mode — thinking and tool detail will be logged to the app log; chat shows a ticking elapsed-time indicator.",
+		LangChinese:            "🔔 完整模式 — 思考和工具调用细节将记录到应用日志；聊天中显示跳动的已运行时间指示器。",
+		LangTraditionalChinese: "🔔 完整模式 — 思考和工具調用細節將記錄到應用日誌；聊天中顯示跳動的已運行時間指示器。",
+		LangJapanese:           "🔔 フルモード — 思考とツール実行の詳細はアプリログにのみ記録され、チャットには経過時間の点滅表示が出ます。",
+		LangSpanish:            "🔔 Modo completo — el detalle de pensamiento y herramientas se registrará solo en el log de la app; el chat mostrará un indicador de tiempo transcurrido.",
 	},
 	MsgDisplayModeCompact: {
 		LangEnglish:            "📋 Compact mode — thinking/tool hidden, each text segment sent separately.",

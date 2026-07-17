@@ -513,7 +513,9 @@ Once running, send messages to your bot on the configured platform. Available sl
 /history [n]     — Show last n messages (default 10)
 /reasoning [level] — View/switch reasoning effort (Codex)
 /mode [name]     — View/switch permission mode (default/edit/plan/yolo)
-/quiet           — Toggle thinking/tool progress messages
+/quiet           — Toggle thinking/tool logging (full mode logs detail to the
+                   app log only; chat always shows a ticking elapsed-time
+                   indicator, never the raw thinking/tool content)
 /allow <tool>    — Pre-allow a tool (next session)
 /provider [...]  — Manage API providers (list/add/remove/switch)
 /stop            — Stop current execution

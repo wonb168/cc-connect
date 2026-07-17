@@ -393,6 +393,10 @@ func TestSideChannelDifferentFinalContract(t *testing.T) {
 	t.Fatalf("texts = %#v, want side-channel plus distinct final reply", texts)
 }
 
+// TestThinkingAndToolEventsContract covers full display mode (both flags
+// true): thinking/tool content is logged to the app log only and never sent
+// to the platform — chat only ever sees the final answer (plus the always-on
+// turn summary).
 func TestThinkingAndToolEventsContract(t *testing.T) {
 	engine, agent, platform := newTurnEngine(t)
 	engine.SetDisplayConfig(core.DisplayCfg{
@@ -417,10 +421,10 @@ func TestThinkingAndToolEventsContract(t *testing.T) {
 	for time.Now().Before(deadline) {
 		texts, _, _, _ := platform.snapshot()
 		joined := strings.Join(texts, "\n")
-		if strings.Contains(joined, "planning the command") &&
-			strings.Contains(joined, "Bash") &&
-			strings.Contains(joined, "tool-output") &&
-			strings.Contains(joined, "final answer") {
+		if strings.Contains(joined, "final answer") {
+			if strings.Contains(joined, "planning the command") || strings.Contains(joined, "Bash") || strings.Contains(joined, "tool-output") {
+				t.Fatalf("full mode should never send thinking/tool content to chat, got %#v", texts)
+			}
 			if countContaining(texts, "final answer") != 1 {
 				t.Fatalf("texts = %#v, want exactly one final answer", texts)
 			}
@@ -429,7 +433,7 @@ func TestThinkingAndToolEventsContract(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	texts, _, _, _ := platform.snapshot()
-	t.Fatalf("texts = %#v, want thinking, tool use/result, and final answer", texts)
+	t.Fatalf("texts = %#v, want final answer without thinking/tool content", texts)
 }
 
 func TestHiddenToolEventsContractKeepsFinalAndHidesToolDetails(t *testing.T) {
@@ -764,17 +768,19 @@ func TestLongFinalResponseKeepsMetadataOnceAtTail(t *testing.T) {
 	t.Fatalf("texts = %#v, want long response split into multiple chunks plus turn summary", texts)
 }
 
+// TestDisplayVisibilityConfigurationMatrix confirms that ThinkingMessages/
+// ToolMessages now only control app-log routing, never chat visibility:
+// regardless of how the flags are set, thinking/tool content never reaches
+// the platform.
 func TestDisplayVisibilityConfigurationMatrix(t *testing.T) {
 	tests := []struct {
-		name         string
-		thinking     bool
-		tools        bool
-		wantThinking bool
-		wantTool     bool
+		name     string
+		thinking bool
+		tools    bool
 	}{
-		{name: "show_both", thinking: true, tools: true, wantThinking: true, wantTool: true},
-		{name: "hide_thinking", thinking: false, tools: true, wantTool: true},
-		{name: "hide_tools", thinking: true, tools: false, wantThinking: true},
+		{name: "show_both", thinking: true, tools: true},
+		{name: "hide_thinking", thinking: false, tools: true},
+		{name: "hide_tools", thinking: true, tools: false},
 		{name: "hide_both", thinking: false, tools: false},
 	}
 
@@ -803,12 +809,12 @@ func TestDisplayVisibilityConfigurationMatrix(t *testing.T) {
 
 			texts, _, _, _ := platform.snapshot()
 			joined := strings.Join(texts, "\n")
-			if got := strings.Contains(joined, "matrix thinking"); got != tt.wantThinking {
-				t.Fatalf("thinking visibility = %v, want %v; texts=%#v", got, tt.wantThinking, texts)
+			if strings.Contains(joined, "matrix thinking") {
+				t.Fatalf("thinking content leaked to chat; texts=%#v", texts)
 			}
 			hasTool := strings.Contains(joined, "Bash") || strings.Contains(joined, "echo visible") || strings.Contains(joined, "visible output")
-			if hasTool != tt.wantTool {
-				t.Fatalf("tool visibility = %v, want %v; texts=%#v", hasTool, tt.wantTool, texts)
+			if hasTool {
+				t.Fatalf("tool content leaked to chat; texts=%#v", texts)
 			}
 			if countContaining(texts, "matrix final") != 1 {
 				t.Fatalf("texts=%#v, want exactly one final answer", texts)
@@ -817,7 +823,7 @@ func TestDisplayVisibilityConfigurationMatrix(t *testing.T) {
 	}
 }
 
-func TestRichCardModeKeepsToolStepsAndFinalMetadataInOneCard(t *testing.T) {
+func TestRichCardModeHidesToolStepsKeepsFinalMetadataInOneCard(t *testing.T) {
 	agent := newTurnAgent()
 	agent.model = "glm-5.1"
 	agent.workDir = "/tmp/release-agent"
@@ -855,9 +861,14 @@ func TestRichCardModeKeepsToolStepsAndFinalMetadataInOneCard(t *testing.T) {
 		t.Fatalf("rich lifecycle = texts:%#v starts:%#v updates:%#v deletes:%#v, want one editable rich card plus turn summary", texts, starts, updates, deletes)
 	}
 	final := updates[len(updates)-1]
-	for _, want := range []string{"status=done", "step=Bash", "rich output", "markdown=rich final"} {
+	for _, want := range []string{"status=done", "markdown=rich final"} {
 		if !strings.Contains(final, want) {
 			t.Fatalf("final rich card = %q, want contains %q", final, want)
+		}
+	}
+	for _, unwanted := range []string{"step=Bash", "rich output", "rich thinking"} {
+		if strings.Contains(final, unwanted) {
+			t.Fatalf("final rich card = %q, must not contain tool/thinking content %q", final, unwanted)
 		}
 	}
 	if !strings.Contains(texts[0], "glm-5.1") || !strings.Contains(texts[0], "context") {

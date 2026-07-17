@@ -72,7 +72,24 @@ type claudeSession struct {
 	// when the session reuses the shared file (the common 99% case)
 	// or when there is nothing to append.
 	promptFilePath string
+
+	// teardownOnce guards terminate() so that both the normal exit path
+	// (cmd.Wait returning in readLoop) and the process watchdog's abnormal
+	// exit path can call it without racing on cs.events/cs.done being
+	// closed or sent to twice.
+	teardownOnce sync.Once
 }
+
+// processState is the result of an OS-level liveness check on a spawned
+// agent process, used by processWatchdog to detect a dead or stuck child
+// faster than waiting for the (multi-hour) event idle timeout.
+type processState int
+
+const (
+	processStateRunning processState = iota
+	processStateZombie               // unix only: exited but not yet reaped
+	processStateGone                 // process no longer exists
+)
 
 // StartupWarning implements core.StartupWarner. Returns a non-empty string
 // when the session was started under degraded conditions that the user should
@@ -460,6 +477,7 @@ func newClaudeSession(ctx context.Context, workDir, cliBin string, cliExtraArgs 
 	cs.alive.Store(true)
 
 	go cs.readLoop(stdout, &stderrBuf)
+	go cs.processWatchdog(cmd.Process.Pid)
 
 	return cs, nil
 }
@@ -512,7 +530,7 @@ func (cs *claudeSession) startReadLoopWait(stdout io.ReadCloser) (<-chan error, 
 func (cs *claudeSession) finishReadLoop(waitErrCh <-chan error, stderrBuf *bytes.Buffer) {
 	err := <-waitErrCh
 
-	cs.alive.Store(false)
+	var evt *core.Event
 	if err != nil {
 		stderrMsg := ""
 		if stderrBuf != nil {
@@ -520,18 +538,90 @@ func (cs *claudeSession) finishReadLoop(waitErrCh <-chan error, stderrBuf *bytes
 		}
 		if stderrMsg != "" {
 			slog.Error("claudeSession: process failed", "error", err, "stderr", stderrMsg)
-			evt := core.Event{Type: core.EventError, Error: fmt.Errorf("%s", stderrMsg)}
+			evt = &core.Event{Type: core.EventError, Error: fmt.Errorf("%s", stderrMsg)}
+		}
+	}
+	cs.terminate(evt)
+}
+
+// terminate tears down the session's event/done channels exactly once,
+// regardless of which path (normal process exit via finishReadLoop, or an
+// abnormal exit detected by processWatchdog) observes the end of the
+// process first. If evt is non-nil it is delivered to the engine before
+// the channels close.
+func (cs *claudeSession) terminate(evt *core.Event) {
+	cs.teardownOnce.Do(func() {
+		cs.alive.Store(false)
+		if evt != nil {
 			select {
-			case cs.events <- evt:
+			case cs.events <- *evt:
 			case <-cs.ctx.Done():
 				// INVARIANT: readLoop must close cs.events and cs.done exactly once
 				// on every termination path. Callers (engine event loop) rely on
 				// these closures to observe session end.
 			}
 		}
+		close(cs.events)
+		close(cs.done)
+	})
+}
+
+// processWatchdogInterval is how often processWatchdog polls the OS for the
+// spawned process's liveness, as a faster-than-idle-timeout backstop against
+// a process that vanishes or gets stuck as a zombie without cmd.Wait()
+// noticing (e.g. a runtime-level hang in Wait itself).
+const processWatchdogInterval = 15 * time.Second
+
+// zombieGracePeriod is how long a persistently-zombie process is tolerated
+// before processWatchdog treats it as stuck. Under normal operation,
+// cmd.Wait() reaps the process (via wait4) the instant it becomes a zombie,
+// so observing a zombie that outlives this grace period across repeated
+// checks indicates Wait() itself is not making progress.
+const zombieGracePeriod = 30 * time.Second
+
+// processWatchdog polls the OS-level state of the spawned process so a
+// vanished or stuck-zombie process is reported immediately instead of
+// waiting for the (multi-hour) event idle timeout to fire. It exits as soon
+// as the session's normal teardown (cs.done) fires.
+func (cs *claudeSession) processWatchdog(pid int) {
+	ticker := time.NewTicker(processWatchdogInterval)
+	defer ticker.Stop()
+
+	var zombieSince time.Time
+	for {
+		select {
+		case <-cs.done:
+			return
+		case <-cs.ctx.Done():
+			return
+		case <-ticker.C:
+			state, err := checkProcessState(pid)
+			if err != nil {
+				slog.Debug("claudeSession: process watchdog check failed", "pid", pid, "error", err)
+				continue
+			}
+			switch state {
+			case processStateGone:
+				slog.Error("claudeSession: process watchdog detected vanished process", "pid", pid)
+				cs.terminate(&core.Event{Type: core.EventError,
+					Error: fmt.Errorf("agent process (pid %d) vanished unexpectedly", pid)})
+				return
+			case processStateZombie:
+				if zombieSince.IsZero() {
+					zombieSince = time.Now()
+					continue
+				}
+				if time.Since(zombieSince) >= zombieGracePeriod {
+					slog.Error("claudeSession: process watchdog detected stuck zombie process", "pid", pid, "zombie_since", zombieSince)
+					cs.terminate(&core.Event{Type: core.EventError,
+						Error: fmt.Errorf("agent process (pid %d) is defunct (zombie) and stuck waiting to be reaped", pid)})
+					return
+				}
+			default:
+				zombieSince = time.Time{}
+			}
+		}
 	}
-	close(cs.events)
-	close(cs.done)
 }
 
 func (cs *claudeSession) handleReadLoopScanErr(err error, waitDone <-chan struct{}) {

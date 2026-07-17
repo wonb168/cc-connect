@@ -111,3 +111,37 @@ func TestSignalProcessGroup_NilCmd(t *testing.T) {
 		t.Errorf("expected no error on nil cmd, got %v", err)
 	}
 }
+
+// TestCheckProcessState_RunningThenReaped is the regression test for the
+// processWatchdog liveness check: a freshly spawned process must report
+// processStateRunning, and once it has exited and been reaped via Wait(),
+// checkProcessState must report processStateGone rather than a stale
+// "running" result.
+func TestCheckProcessState_RunningThenReaped(t *testing.T) {
+	cmd := exec.Command("/bin/sleep", "5")
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	pid := cmd.Process.Pid
+
+	state, err := checkProcessState(pid)
+	if err != nil {
+		t.Fatalf("checkProcessState while running: %v", err)
+	}
+	if state != processStateRunning {
+		t.Fatalf("checkProcessState while running = %v, want processStateRunning", state)
+	}
+
+	if err := cmd.Process.Kill(); err != nil {
+		t.Fatalf("kill: %v", err)
+	}
+	_ = cmd.Wait() // reap so the pid is no longer valid to query
+
+	state, err = checkProcessState(pid)
+	if err != nil {
+		t.Fatalf("checkProcessState after reap: %v", err)
+	}
+	if state != processStateGone {
+		t.Fatalf("checkProcessState after reap = %v, want processStateGone", state)
+	}
+}

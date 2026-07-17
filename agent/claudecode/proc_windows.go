@@ -11,6 +11,8 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+
+	"golang.org/x/sys/windows"
 )
 
 // prepareCmdForKill puts the spawned child into a new process group on
@@ -82,4 +84,32 @@ func processKillOutput(output []byte) string {
 		return "(empty output)"
 	}
 	return trimmed
+}
+
+// stillActive is the sentinel exit code Windows reports via
+// GetExitCodeProcess while a process has not yet terminated.
+const stillActive = 259 // STILL_ACTIVE
+
+// checkProcessState reports whether pid is still running. Windows has no
+// zombie-process concept (a terminated process's handle simply becomes
+// invalid once all references are closed), so this only ever distinguishes
+// processStateRunning from processStateGone.
+func checkProcessState(pid int) (processState, error) {
+	handle, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, uint32(pid))
+	if err != nil {
+		if errors.Is(err, windows.ERROR_INVALID_PARAMETER) {
+			return processStateGone, nil
+		}
+		return processStateRunning, err
+	}
+	defer windows.CloseHandle(handle)
+
+	var exitCode uint32
+	if err := windows.GetExitCodeProcess(handle, &exitCode); err != nil {
+		return processStateRunning, err
+	}
+	if exitCode != stillActive {
+		return processStateGone, nil
+	}
+	return processStateRunning, nil
 }

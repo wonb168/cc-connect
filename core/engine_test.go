@@ -1,12 +1,15 @@
 package core
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"sync"
@@ -15,6 +18,10 @@ import (
 	"time"
 	"unicode/utf8"
 )
+
+// elapsedTickerPattern matches the "⏳ Running <duration>" ticker text
+// (MsgQuietElapsed) used to prove a turn is alive without leaking content.
+var elapsedTickerPattern = regexp.MustCompile(`⏳ Running `)
 
 // --- stubs for Engine tests ---
 
@@ -1259,26 +1266,28 @@ func TestProcessInteractiveEvents_ToolMessagesDisabledSuppressesToolProgressOnly
 
 	e.processInteractiveEvents(state, session, e.sessions, sessionKey, "m1", time.Now(), nil, nil, nil)
 
-	// final response with optional standalone thinking message, plus the
-	// always-on turn summary as the very last message.
+	// Thinking/tool detail is never sent to chat regardless of the
+	// ThinkingMessages/ToolMessages flags — only the final response plus the
+	// always-on turn summary should be sent.
 	sent := p.getSent()
-	if len(sent) < 2 || len(sent) > 3 {
-		t.Fatalf("sent = %#v, want final response with optional standalone thinking message, plus turn summary", sent)
+	if len(sent) != 2 {
+		t.Fatalf("sent = %#v, want final response plus turn summary", sent)
 	}
 	for _, msg := range sent {
-		if strings.Contains(msg, "Bash") || strings.Contains(msg, "echo hi") || strings.Contains(msg, "hi") {
-			t.Fatalf("tool progress should stay hidden, got %q", msg)
+		if strings.Contains(msg, "Bash") || strings.Contains(msg, "echo hi") || strings.Contains(msg, "hi") || strings.Contains(msg, "planning") {
+			t.Fatalf("tool/thinking progress should stay hidden, got %q", msg)
 		}
 	}
-	if len(sent) == 3 && !strings.Contains(sent[0], "planning") {
-		t.Fatalf("thinking message = %q, want planning", sent[0])
-	}
-	if sent[len(sent)-2] != "done" {
-		t.Fatalf("final message = %q, want done", sent[len(sent)-2])
+	if sent[0] != "done" {
+		t.Fatalf("final message = %q, want done", sent[0])
 	}
 }
 
-func TestProcessInteractiveEvents_CompactProgressCoalescesThinkingAndToolUse(t *testing.T) {
+// TestProcessInteractiveEvents_FullModeHidesThinkingAndToolUseShowsTicker
+// covers the default (full) display mode: thinking/tool content must never
+// leak into the chat-facing preview, which instead only ever shows the
+// quiet-style elapsed-time ticker text.
+func TestProcessInteractiveEvents_FullModeHidesThinkingAndToolUseShowsTicker(t *testing.T) {
 	p := &stubCompactProgressPlatform{stubPlatformEngine: stubPlatformEngine{n: "feishu"}}
 	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
 	sessionKey := "feishu:user1"
@@ -1298,30 +1307,83 @@ func TestProcessInteractiveEvents_CompactProgressCoalescesThinkingAndToolUse(t *
 
 	e.processInteractiveEvents(state, session, e.sessions, sessionKey, "m1", time.Now(), nil, nil, state.replyCtx)
 
-	// Final assistant reply plus the always-on turn summary.
+	// The final answer text is finalized in-place via the streaming preview;
+	// only the always-on turn summary goes through a standalone Send/Reply.
 	sent := p.getSent()
-	if len(sent) != 2 || sent[0] != "done" {
-		t.Fatalf("sent = %#v, want final assistant reply plus turn summary", sent)
+	if len(sent) != 1 {
+		t.Fatalf("sent = %#v, want only the turn summary message", sent)
 	}
 
 	starts := p.getPreviewStarts()
-	if len(starts) != 1 {
-		t.Fatalf("preview starts = %d, want 1", len(starts))
-	}
-	if !strings.Contains(starts[0], "Thinking") {
-		t.Fatalf("start preview should contain thinking text, got %q", starts[0])
-	}
-
 	edits := p.getPreviewEdits()
-	if len(edits) != 1 {
-		t.Fatalf("preview edits = %d, want 1", len(edits))
+	all := append(append([]string{}, starts...), edits...)
+	if len(all) == 0 {
+		t.Fatal("expected at least one preview update showing the elapsed-time ticker")
 	}
-	if !strings.Contains(edits[0], "pwd") {
-		t.Fatalf("updated preview should contain tool input, got %q", edits[0])
+	for _, u := range all {
+		if strings.Contains(u, "Thinking about command") || strings.Contains(u, "pwd") {
+			t.Fatalf("full mode should hide thinking/tool content from chat, got %q", u)
+		}
+	}
+	if edits[len(edits)-1] != "done" {
+		t.Fatalf("final preview update = %q, want the finalized answer text", edits[len(edits)-1])
 	}
 }
 
-func TestProcessInteractiveEvents_CardProgressUsesCardTemplate(t *testing.T) {
+// TestProcessInteractiveEvents_CompactModeCoalescesThinkingAndToolUse covers
+// the true "compact" display mode (Mode: "compact", both flags false). Unlike
+// full mode, thinking/tool events are never even used to update a ticking
+// status line — they only act as freeze/detach boundaries so that any text
+// accumulated so far is flushed as its own permanent message before the next
+// segment starts. Thinking/tool content itself must never leak into chat.
+func TestProcessInteractiveEvents_CompactModeCoalescesThinkingAndToolUse(t *testing.T) {
+	p := &stubCompactProgressPlatform{stubPlatformEngine: stubPlatformEngine{n: "feishu"}}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	e.SetDisplayConfig(DisplayCfg{Mode: "compact", ThinkingMaxLen: 300, ToolMaxLen: 500})
+	sessionKey := "feishu:user1"
+	session := e.sessions.GetOrCreateActive(sessionKey)
+	agentSession := newControllableSession("s1")
+	state := &interactiveState{
+		agentSession: agentSession,
+		platform:     p,
+		replyCtx:     "ctx-compact",
+	}
+	e.interactiveStates[sessionKey] = state
+
+	agentSession.events <- Event{Type: EventText, Content: "First segment. "}
+	agentSession.events <- Event{Type: EventThinking, Content: "Thinking about command"}
+	agentSession.events <- Event{Type: EventToolUse, ToolName: "Bash", ToolInput: "pwd"}
+	agentSession.events <- Event{Type: EventText, Content: "Second segment."}
+	agentSession.events <- Event{Type: EventResult, Content: "First segment. Second segment.", Done: true}
+
+	e.processInteractiveEvents(state, session, e.sessions, sessionKey, "m1", time.Now(), nil, nil, state.replyCtx)
+
+	// The first text segment gets frozen+detached as its own message at the
+	// thinking boundary; the second segment is finalized separately, followed
+	// by the always-on turn summary.
+	sent := p.getSent()
+	if len(sent) != 2 || sent[0] != "Second segment." {
+		t.Fatalf("sent = %#v, want second segment plus turn summary", sent)
+	}
+
+	starts := p.getPreviewStarts()
+	if len(starts) != 1 || starts[0] != "First segment. " {
+		t.Fatalf("preview starts = %#v, want [%q]", starts, "First segment. ")
+	}
+
+	edits := p.getPreviewEdits()
+	for _, u := range append(append([]string{}, starts...), edits...) {
+		if strings.Contains(u, "Thinking about command") || strings.Contains(u, "pwd") {
+			t.Fatalf("compact mode should never show thinking/tool content, got %q", u)
+		}
+	}
+}
+
+// TestProcessInteractiveEvents_FullModeCardStyleHidesToolContentShowsTicker
+// covers the default (full) display mode with the "card" progress style:
+// tool/thinking content must never leak into the preview card, which instead
+// only ever shows the quiet-style elapsed-time ticker text.
+func TestProcessInteractiveEvents_FullModeCardStyleHidesToolContentShowsTicker(t *testing.T) {
 	p := &stubCompactProgressPlatform{
 		stubPlatformEngine: stubPlatformEngine{n: "feishu"},
 		style:              "card",
@@ -1344,32 +1406,72 @@ func TestProcessInteractiveEvents_CardProgressUsesCardTemplate(t *testing.T) {
 
 	e.processInteractiveEvents(state, session, e.sessions, sessionKey, "m2", time.Now(), nil, nil, state.replyCtx)
 
-	// Final assistant reply plus the always-on turn summary.
+	// The final answer text is finalized in-place via the streaming preview;
+	// only the always-on turn summary goes through a standalone Send/Reply.
 	sent := p.getSent()
-	if len(sent) != 2 || sent[0] != "done" {
-		t.Fatalf("sent = %#v, want final assistant reply plus turn summary", sent)
+	if len(sent) != 1 {
+		t.Fatalf("sent = %#v, want only the turn summary message", sent)
 	}
 
 	starts := p.getPreviewStarts()
-	if len(starts) != 1 {
-		t.Fatalf("preview starts = %d, want 1", len(starts))
+	edits := p.getPreviewEdits()
+	all := append(append([]string{}, starts...), edits...)
+	if len(all) == 0 {
+		t.Fatal("expected at least one preview update showing the elapsed-time ticker")
 	}
-	if !strings.Contains(starts[0], "**Progress**") {
-		t.Fatalf("start preview should contain fallback progress title, got %q", starts[0])
+	for _, u := range all {
+		if strings.Contains(u, "Plan first") || strings.Contains(u, "echo hi") || strings.Contains(u, "**Progress**") {
+			t.Fatalf("full mode should hide thinking/tool content from chat, got %q", u)
+		}
 	}
-	if !strings.Contains(starts[0], "1.") {
-		t.Fatalf("start preview should contain first item index, got %q", starts[0])
+}
+
+// TestProcessInteractiveEvents_CompactModeCardStyleUsesCardTemplate covers the
+// true "compact" display mode with the "card" progress style, which keeps its
+// same freeze+detach text-segment behavior as the default progress style,
+// since thinking/tool events no longer render any content-bearing progress
+// card in any mode — only the elapsed-time ticker (full/quiet) or a plain
+// segment flush (compact) at thinking/tool boundaries.
+func TestProcessInteractiveEvents_CompactModeCardStyleUsesCardTemplate(t *testing.T) {
+	p := &stubCompactProgressPlatform{
+		stubPlatformEngine: stubPlatformEngine{n: "feishu"},
+		style:              "card",
+	}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	e.SetDisplayConfig(DisplayCfg{Mode: "compact", ThinkingMaxLen: 300, ToolMaxLen: 500})
+	sessionKey := "feishu:user2"
+	session := e.sessions.GetOrCreateActive(sessionKey)
+	agentSession := newControllableSession("s2")
+	state := &interactiveState{
+		agentSession: agentSession,
+		platform:     p,
+		replyCtx:     "ctx-card",
+	}
+	e.interactiveStates[sessionKey] = state
+
+	agentSession.events <- Event{Type: EventText, Content: "First segment. "}
+	agentSession.events <- Event{Type: EventThinking, Content: "Plan first"}
+	agentSession.events <- Event{Type: EventToolUse, ToolName: "Bash", ToolInput: "echo hi"}
+	agentSession.events <- Event{Type: EventText, Content: "Second segment."}
+	agentSession.events <- Event{Type: EventResult, Content: "First segment. Second segment.", Done: true}
+
+	e.processInteractiveEvents(state, session, e.sessions, sessionKey, "m2", time.Now(), nil, nil, state.replyCtx)
+
+	sent := p.getSent()
+	if len(sent) != 2 || sent[0] != "Second segment." {
+		t.Fatalf("sent = %#v, want second segment plus turn summary", sent)
+	}
+
+	starts := p.getPreviewStarts()
+	if len(starts) != 1 || starts[0] != "First segment. " {
+		t.Fatalf("preview starts = %#v, want [%q]", starts, "First segment. ")
 	}
 
 	edits := p.getPreviewEdits()
-	if len(edits) != 1 {
-		t.Fatalf("preview edits = %d, want 1", len(edits))
-	}
-	if !strings.Contains(edits[0], "2.") {
-		t.Fatalf("updated preview should contain second item index, got %q", edits[0])
-	}
-	if !strings.Contains(edits[0], "echo hi") {
-		t.Fatalf("updated preview should contain tool command, got %q", edits[0])
+	for _, u := range append(append([]string{}, starts...), edits...) {
+		if strings.Contains(u, "Plan first") || strings.Contains(u, "echo hi") {
+			t.Fatalf("compact mode should never show thinking/tool content, got %q", u)
+		}
 	}
 }
 
@@ -1459,7 +1561,11 @@ func TestProcessInteractiveEvents_FinalReplyRemainsRawWhenReferencesDisabled(t *
 	}
 }
 
-func TestProcessInteractiveEvents_CardProgressUsesStructuredPayloadWhenSupported(t *testing.T) {
+// TestProcessInteractiveEvents_FullModeStructuredPayloadHidesContentShowsTicker
+// covers the default (full) display mode with the structured-payload card
+// style: thinking/tool content must never leak into the payload, which
+// instead only ever carries the quiet-style elapsed-time ticker text.
+func TestProcessInteractiveEvents_FullModeStructuredPayloadHidesContentShowsTicker(t *testing.T) {
 	p := &stubCompactProgressPlatform{
 		stubPlatformEngine: stubPlatformEngine{n: "feishu"},
 		style:              "card",
@@ -1484,51 +1590,76 @@ func TestProcessInteractiveEvents_CardProgressUsesStructuredPayloadWhenSupported
 	e.processInteractiveEvents(state, session, e.sessions, sessionKey, "m3", time.Now(), nil, nil, state.replyCtx)
 
 	starts := p.getPreviewStarts()
-	if len(starts) != 1 {
-		t.Fatalf("preview starts = %d, want 1", len(starts))
-	}
-	if !strings.HasPrefix(starts[0], ProgressCardPayloadPrefix) {
-		t.Fatalf("start preview should be structured payload, got %q", starts[0])
-	}
-	startPayload, ok := ParseProgressCardPayload(starts[0])
-	if !ok {
-		t.Fatalf("start preview should parse as structured payload, got %q", starts[0])
-	}
-	if len(startPayload.Items) != 1 {
-		t.Fatalf("start payload items = %d, want 1", len(startPayload.Items))
-	}
-	if startPayload.Items[0].Kind != ProgressEntryThinking {
-		t.Fatalf("start payload kind = %q, want %q", startPayload.Items[0].Kind, ProgressEntryThinking)
-	}
-	if startPayload.State != ProgressCardStateRunning {
-		t.Fatalf("start payload state = %q, want %q", startPayload.State, ProgressCardStateRunning)
-	}
-
 	edits := p.getPreviewEdits()
-	if len(edits) != 2 {
-		t.Fatalf("preview edits = %d, want 2", len(edits))
+	all := append(append([]string{}, starts...), edits...)
+	if len(all) == 0 {
+		t.Fatal("expected at least one preview update showing the elapsed-time ticker")
 	}
-	updatePayload, ok := ParseProgressCardPayload(edits[0])
-	if !ok {
-		t.Fatalf("update preview should parse as structured payload, got %q", edits[0])
-	}
-	if len(updatePayload.Items) != 2 {
-		t.Fatalf("update payload items = %d, want 2", len(updatePayload.Items))
-	}
-	if !strings.Contains(updatePayload.Items[1].Text, "echo hi") {
-		t.Fatalf("second payload item should contain tool command, got %q", updatePayload.Items[1].Text)
-	}
-
-	finalPayload, ok := ParseProgressCardPayload(edits[1])
-	if !ok {
-		t.Fatalf("final preview should parse as structured payload, got %q", edits[1])
-	}
-	if finalPayload.State != ProgressCardStateCompleted {
-		t.Fatalf("final payload state = %q, want %q", finalPayload.State, ProgressCardStateCompleted)
+	for _, u := range all {
+		if strings.Contains(u, "Plan first") || strings.Contains(u, "echo hi") || strings.HasPrefix(u, ProgressCardPayloadPrefix) {
+			t.Fatalf("full mode should hide thinking/tool content from chat, got %q", u)
+		}
 	}
 }
 
-func TestProcessInteractiveEvents_RichCardShowsThinkingContent(t *testing.T) {
+// TestProcessInteractiveEvents_CompactModeStructuredPayloadWhenSupported
+// covers the true "compact" display mode with a platform that supports
+// structured progress-card payloads. Even though the platform could render a
+// per-event payload, compact mode never builds one for thinking/tool
+// events — it only uses them as freeze/detach boundaries around plain text
+// segments, same as any other platform style.
+func TestProcessInteractiveEvents_CompactModeStructuredPayloadWhenSupported(t *testing.T) {
+	p := &stubCompactProgressPlatform{
+		stubPlatformEngine: stubPlatformEngine{n: "feishu"},
+		style:              "card",
+		supportPayload:     true,
+	}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	e.SetDisplayConfig(DisplayCfg{Mode: "compact", ThinkingMaxLen: 300, ToolMaxLen: 500})
+	sessionKey := "feishu:user3"
+	session := e.sessions.GetOrCreateActive(sessionKey)
+	agentSession := newControllableSession("s3")
+	state := &interactiveState{
+		agentSession: agentSession,
+		platform:     p,
+		replyCtx:     "ctx-card-structured",
+	}
+	e.interactiveStates[sessionKey] = state
+
+	agentSession.events <- Event{Type: EventText, Content: "First segment. "}
+	agentSession.events <- Event{Type: EventThinking, Content: "Plan first"}
+	agentSession.events <- Event{Type: EventToolUse, ToolName: "Bash", ToolInput: "echo hi"}
+	agentSession.events <- Event{Type: EventText, Content: "Second segment."}
+	agentSession.events <- Event{Type: EventResult, Content: "First segment. Second segment.", Done: true}
+
+	e.processInteractiveEvents(state, session, e.sessions, sessionKey, "m3", time.Now(), nil, nil, state.replyCtx)
+
+	sent := p.getSent()
+	if len(sent) != 2 || sent[0] != "Second segment." {
+		t.Fatalf("sent = %#v, want second segment plus turn summary", sent)
+	}
+
+	starts := p.getPreviewStarts()
+	if len(starts) != 1 || starts[0] != "First segment. " {
+		t.Fatalf("preview starts = %#v, want [%q]", starts, "First segment. ")
+	}
+
+	edits := p.getPreviewEdits()
+	for _, u := range append(append([]string{}, starts...), edits...) {
+		if strings.HasPrefix(u, ProgressCardPayloadPrefix) {
+			t.Fatalf("compact mode should never build a structured progress payload, got %q", u)
+		}
+		if strings.Contains(u, "Plan first") || strings.Contains(u, "echo hi") {
+			t.Fatalf("compact mode should never show thinking/tool content, got %q", u)
+		}
+	}
+}
+
+// TestProcessInteractiveEvents_RichCardHidesThinkingContentShowsTicker covers
+// the rich-card path in full display mode: thinking content is logged, never
+// rendered into the card, which instead only ever shows the elapsed-time
+// ticker title.
+func TestProcessInteractiveEvents_RichCardHidesThinkingContentShowsTicker(t *testing.T) {
 	p := &stubCompactProgressPlatform{
 		stubPlatformEngine: stubPlatformEngine{n: "feishu"},
 		style:              "card",
@@ -1563,12 +1694,16 @@ func TestProcessInteractiveEvents_RichCardShowsThinkingContent(t *testing.T) {
 	if len(starts) != 1 {
 		t.Fatalf("preview starts = %d, want 1", len(starts))
 	}
-	if !strings.Contains(starts[0], "Inspecting event routing") {
-		t.Fatalf("rich card start should contain thinking content, got %q", starts[0])
+	if strings.Contains(starts[0], "Inspecting event routing") {
+		t.Fatalf("rich card should hide thinking content from chat, got %q", starts[0])
 	}
 }
 
-func TestProcessInteractiveEvents_RichCardCoalescesToolResult(t *testing.T) {
+// TestProcessInteractiveEvents_RichCardHidesToolResultShowsTicker covers the
+// rich-card path in full display mode: tool use/result content is logged,
+// never rendered into the card, which instead only ever shows the
+// elapsed-time ticker title.
+func TestProcessInteractiveEvents_RichCardHidesToolResultShowsTicker(t *testing.T) {
 	p := &stubCompactProgressPlatform{
 		stubPlatformEngine: stubPlatformEngine{n: "feishu"},
 		style:              "card",
@@ -1607,9 +1742,9 @@ func TestProcessInteractiveEvents_RichCardCoalescesToolResult(t *testing.T) {
 		t.Fatalf("preview starts = %d, want only the rich card start and no separate progress card", len(starts))
 	}
 	rendered := strings.Join(append(starts, p.getPreviewEdits()...), "\n")
-	for _, want := range []string{"echo hi", "completed", "hi"} {
-		if !strings.Contains(rendered, want) {
-			t.Fatalf("rich card should contain %q, got %q", want, rendered)
+	for _, unwanted := range []string{"echo hi", "completed"} {
+		if strings.Contains(rendered, unwanted) {
+			t.Fatalf("rich card should hide tool content %q from chat, got %q", unwanted, rendered)
 		}
 	}
 }
@@ -1902,11 +2037,11 @@ func TestProcessInteractiveEvents_RichCard_TextThenNoReply_PreservesBody(t *test
 }
 
 // TestProcessInteractiveEvents_RichCard_ToolThenNoReply verifies that when a
-// turn issues tool calls (creating the rich card with visible tool steps) and
-// then resolves to NO_REPLY, the card is finalized to Done — not deleted.
-// Deleting would leave a "撤回了一条消息" gray bar matched up with already-
-// visible tool activity. This mirrors legacy + full mode where tool messages
-// remain visible even when the final reply is silent.
+// turn issues tool calls and then resolves to NO_REPLY, the tool card is
+// deleted rather than finalized. Tool activity is no longer rendered into the
+// card body (only the elapsed-time ticker is, transiently) — so once the turn
+// resolves to a silent reply there is no visible content left to preserve,
+// and the card is cleaned up like any other silent turn.
 func TestProcessInteractiveEvents_RichCard_ToolThenNoReply(t *testing.T) {
 	p := &stubRichCardSilentPlatform{
 		stubPlatformEngine: stubPlatformEngine{n: "feishu"},
@@ -1946,18 +2081,13 @@ func TestProcessInteractiveEvents_RichCard_ToolThenNoReply(t *testing.T) {
 	if len(streams) != 0 {
 		t.Fatalf("expected no StreamRichCardText (silentHold gates text path), got %d: %v", len(streams), streams)
 	}
-	if deletes != 0 {
-		t.Fatalf("expected no DeletePreviewMessage (tool card finalized in place), got %d", deletes)
+	if deletes != 1 {
+		t.Fatalf("expected the tool card to be deleted (no visible content to preserve), got %d", deletes)
 	}
-	if len(updates) == 0 {
-		t.Fatalf("expected at least one UpdateMessage (final Done finalize)")
-	}
-	last := updates[len(updates)-1]
-	if !strings.Contains(last, "status=done") {
-		t.Fatalf("final update should show status=done, got %q", last)
-	}
-	if strings.Contains(last, "NO_REPLY") {
-		t.Fatalf("finalize should not include NO_REPLY in body, got %q", last)
+	for _, u := range updates {
+		if strings.Contains(u, "NO_REPLY") {
+			t.Fatalf("no update should include NO_REPLY in body, got %q", u)
+		}
 	}
 }
 
@@ -5441,8 +5571,8 @@ func TestCmdQuiet_TogglesDisplay(t *testing.T) {
 		t.Fatalf("after 3rd /quiet: Mode=%q, TM=%v, Tool=%v, want full/true/true",
 			e.display.Mode, e.display.ThinkingMessages, e.display.ToolMessages)
 	}
-	if len(p.sent) != 1 || !strings.Contains(p.sent[0], "Quiet mode OFF") {
-		t.Fatalf("sent = %q, want quiet OFF message", p.sent)
+	if len(p.sent) != 1 || !strings.Contains(p.sent[0], "Full mode") {
+		t.Fatalf("sent = %q, want full mode message", p.sent)
 	}
 
 	// /quiet with explicit argument
@@ -15081,5 +15211,312 @@ func TestAgentSystemPrompt_DocumentsAudioVideoFlags(t *testing.T) {
 	// doesn't silently downgrade --audio/--video to --file.
 	if !strings.Contains(prompt, "Do NOT downgrade") {
 		t.Error("AgentSystemPrompt missing the 'Do NOT downgrade' anti-regression line")
+	}
+}
+
+func TestFormatElapsedShort(t *testing.T) {
+	cases := []struct {
+		in   time.Duration
+		want string
+	}{
+		{0, "0s"},
+		{3 * time.Second, "3s"},
+		{59 * time.Second, "59s"},
+		{60 * time.Second, "1m00s"},
+		{65 * time.Second, "1m05s"},
+		{125 * time.Second, "2m05s"},
+	}
+	for _, tc := range cases {
+		if got := formatElapsedShort(tc.in); got != tc.want {
+			t.Errorf("formatElapsedShort(%v) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+// TestQuietMode_TickerShowsElapsedTime_NoThinkingOrToolLeak verifies that in
+// quiet display mode, the periodic status ticker refreshes a pure
+// elapsed-time string (proving the turn is alive) without ever leaking
+// thinking content or tool names — the user's requirement is that quiet
+// mode reveal nothing about what the agent is doing internally.
+func TestQuietMode_TickerShowsElapsedTime_NoThinkingOrToolLeak(t *testing.T) {
+	p := &stubCompactProgressPlatform{stubPlatformEngine: stubPlatformEngine{n: "test"}}
+	sess := newControllableSession("quiet-ticker")
+	agent := &controllableAgent{nextSession: sess}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+	e.streamPreview = DefaultStreamPreviewCfg()
+	e.display.Mode = "quiet"
+	e.display.ThinkingMessages = false
+	e.display.ToolMessages = false
+	e.SetQuietStatusTickInterval(30 * time.Millisecond)
+
+	key := "test:quiet-ticker"
+	state := &interactiveState{
+		agentSession: sess,
+		platform:     p,
+		replyCtx:     "ctx",
+	}
+	e.interactiveMu.Lock()
+	e.interactiveStates[key] = state
+	e.interactiveMu.Unlock()
+
+	session := e.sessions.GetOrCreateActive(key)
+	session.TryLock()
+
+	done := make(chan struct{})
+	go func() {
+		e.processInteractiveEvents(state, session, e.sessions, key, "", time.Now(), nil, nil, "ctx")
+		close(done)
+	}()
+
+	// Give the ticker a couple of intervals to fire while the agent is
+	// "thinking" with no forward progress, then let the turn finish.
+	time.Sleep(120 * time.Millisecond)
+	sess.events <- Event{Type: EventThinking, Content: "some very secret internal reasoning"}
+	time.Sleep(120 * time.Millisecond)
+	sess.events <- Event{Type: EventToolUse, ToolName: "Bash", ToolInput: "rm -rf /tmp/x"}
+	time.Sleep(120 * time.Millisecond)
+	sess.events <- Event{Type: EventResult, Content: "final answer", Done: true}
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("turn did not complete in time")
+	}
+
+	edits := p.getPreviewEdits()
+	starts := p.getPreviewStarts()
+	all := append(append([]string{}, starts...), edits...)
+	if len(all) == 0 {
+		t.Fatal("expected at least one preview update from the quiet-mode ticker")
+	}
+	for _, u := range all {
+		if strings.Contains(u, "Bash") || strings.Contains(u, "rm -rf") ||
+			strings.Contains(u, "secret internal reasoning") || strings.Contains(u, "思考") {
+			t.Errorf("quiet mode leaked internal detail in preview update: %q", u)
+		}
+	}
+}
+
+// TestFullMode_TickerShowsElapsedTime_NoThinkingOrToolLeak_LogsToSlog verifies
+// that in full display mode (ThinkingMessages/ToolMessages true), thinking
+// and tool content never leaks into chat — the preview only ever shows the
+// elapsed-time ticker — while the same content IS written to slog.
+func TestFullMode_TickerShowsElapsedTime_NoThinkingOrToolLeak_LogsToSlog(t *testing.T) {
+	prevLogger := slog.Default()
+	logBuf := &bytes.Buffer{}
+	slog.SetDefault(slog.New(slog.NewJSONHandler(logBuf, &slog.HandlerOptions{Level: slog.LevelInfo})))
+	defer slog.SetDefault(prevLogger)
+
+	p := &stubCompactProgressPlatform{stubPlatformEngine: stubPlatformEngine{n: "test"}}
+	sess := newControllableSession("full-ticker")
+	agent := &controllableAgent{nextSession: sess}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+	e.streamPreview = DefaultStreamPreviewCfg()
+	e.display.Mode = "full"
+	e.display.ThinkingMessages = true
+	e.display.ToolMessages = true
+	e.SetQuietStatusTickInterval(30 * time.Millisecond)
+
+	key := "test:full-ticker"
+	state := &interactiveState{
+		agentSession: sess,
+		platform:     p,
+		replyCtx:     "ctx",
+	}
+	e.interactiveMu.Lock()
+	e.interactiveStates[key] = state
+	e.interactiveMu.Unlock()
+
+	session := e.sessions.GetOrCreateActive(key)
+	session.TryLock()
+
+	done := make(chan struct{})
+	go func() {
+		e.processInteractiveEvents(state, session, e.sessions, key, "", time.Now(), nil, nil, "ctx")
+		close(done)
+	}()
+
+	time.Sleep(120 * time.Millisecond)
+	sess.events <- Event{Type: EventThinking, Content: "some very secret internal reasoning"}
+	time.Sleep(120 * time.Millisecond)
+	sess.events <- Event{Type: EventToolUse, ToolName: "Bash", ToolInput: "rm -rf /tmp/x"}
+	time.Sleep(120 * time.Millisecond)
+	sess.events <- Event{Type: EventResult, Content: "final answer", Done: true}
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("turn did not complete in time")
+	}
+
+	edits := p.getPreviewEdits()
+	starts := p.getPreviewStarts()
+	all := append(append([]string{}, starts...), edits...)
+	if len(all) == 0 {
+		t.Fatal("expected at least one preview update from the full-mode ticker")
+	}
+	for _, u := range all {
+		if strings.Contains(u, "Bash") || strings.Contains(u, "rm -rf") ||
+			strings.Contains(u, "secret internal reasoning") {
+			t.Errorf("full mode leaked internal detail into chat preview: %q", u)
+		}
+	}
+
+	logOutput := logBuf.String()
+	if !strings.Contains(logOutput, "some very secret internal reasoning") {
+		t.Error("expected slog to capture the thinking content")
+	}
+	if !strings.Contains(logOutput, "Bash") || !strings.Contains(logOutput, "rm -rf /tmp/x") {
+		t.Error("expected slog to capture the tool name and input")
+	}
+}
+
+// TestStreamingCard_FullMode_TickerShowsElapsedTime verifies that platforms
+// using the StreamingCard path (e.g. DingTalk) also get a ticking
+// elapsed-time status line in full display mode, and never see thinking/tool
+// content in the card body.
+func TestStreamingCard_FullMode_TickerShowsElapsedTime(t *testing.T) {
+	p := &stubStreamingCardTickerPlatform{stubPlatformEngine: stubPlatformEngine{n: "dingtalk"}}
+	sess := newControllableSession("streamcard-ticker")
+	agent := &controllableAgent{nextSession: sess}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+	e.streamPreview = DefaultStreamPreviewCfg()
+	e.display.Mode = "full"
+	e.display.ThinkingMessages = true
+	e.display.ToolMessages = true
+	e.SetQuietStatusTickInterval(30 * time.Millisecond)
+
+	key := "test:streamcard-ticker"
+	state := &interactiveState{
+		agentSession: sess,
+		platform:     p,
+		replyCtx:     "ctx",
+	}
+	e.interactiveMu.Lock()
+	e.interactiveStates[key] = state
+	e.interactiveMu.Unlock()
+
+	session := e.sessions.GetOrCreateActive(key)
+	session.TryLock()
+
+	done := make(chan struct{})
+	go func() {
+		e.processInteractiveEvents(state, session, e.sessions, key, "", time.Now(), nil, nil, "ctx")
+		close(done)
+	}()
+
+	time.Sleep(120 * time.Millisecond)
+	sess.events <- Event{Type: EventThinking, Content: "secret reasoning"}
+	time.Sleep(120 * time.Millisecond)
+	sess.events <- Event{Type: EventToolUse, ToolName: "Bash", ToolInput: "rm -rf /tmp/x"}
+	time.Sleep(120 * time.Millisecond)
+	sess.events <- Event{Type: EventResult, Content: "final answer", Done: true}
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("turn did not complete in time")
+	}
+
+	updates := p.card.getUpdates()
+	if len(updates) == 0 {
+		t.Fatal("expected at least one StreamingCard.Update from the ticker or events")
+	}
+	for _, u := range updates {
+		if strings.Contains(u, "secret reasoning") || strings.Contains(u, "rm -rf") || strings.Contains(u, "Bash") {
+			t.Errorf("streaming card leaked internal detail: %q", u)
+		}
+	}
+}
+
+// stubStreamingCardTickerPlatform / stubTickerStreamingCard capture every
+// Update call made to a StreamingCard so tests can assert on ticker behavior.
+type stubStreamingCardTickerPlatform struct {
+	stubPlatformEngine
+	card *stubTickerStreamingCard
+}
+
+func (p *stubStreamingCardTickerPlatform) CreateStreamingCard(_ context.Context, _ any) (StreamingCard, error) {
+	p.card = &stubTickerStreamingCard{}
+	return p.card, nil
+}
+
+type stubTickerStreamingCard struct {
+	mu      sync.Mutex
+	updates []string
+}
+
+func (c *stubTickerStreamingCard) Update(_ context.Context, content string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.updates = append(c.updates, content)
+	return nil
+}
+func (c *stubTickerStreamingCard) Finalize(_ context.Context, content string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.updates = append(c.updates, content)
+	return nil
+}
+func (c *stubTickerStreamingCard) Failed() bool { return false }
+
+func (c *stubTickerStreamingCard) getUpdates() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]string{}, c.updates...)
+}
+
+// TestCompactMode_TickerDoesNotFire is a regression test verifying that the
+// periodic status ticker never activates in true compact display mode
+// (Mode: "compact", ThinkingMessages/ToolMessages both false) — that mode
+// uses freeze+detach text splitting instead, with no elapsed-time status line.
+func TestCompactMode_TickerDoesNotFire(t *testing.T) {
+	p := &stubCompactProgressPlatform{stubPlatformEngine: stubPlatformEngine{n: "test"}}
+	sess := newControllableSession("compact-ticker")
+	agent := &controllableAgent{nextSession: sess}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+	e.streamPreview = DefaultStreamPreviewCfg()
+	e.display.Mode = "compact"
+	e.display.ThinkingMessages = false
+	e.display.ToolMessages = false
+	e.SetQuietStatusTickInterval(30 * time.Millisecond)
+
+	key := "test:compact-ticker"
+	state := &interactiveState{
+		agentSession: sess,
+		platform:     p,
+		replyCtx:     "ctx",
+	}
+	e.interactiveMu.Lock()
+	e.interactiveStates[key] = state
+	e.interactiveMu.Unlock()
+
+	session := e.sessions.GetOrCreateActive(key)
+	session.TryLock()
+
+	done := make(chan struct{})
+	go func() {
+		e.processInteractiveEvents(state, session, e.sessions, key, "", time.Now(), nil, nil, "ctx")
+		close(done)
+	}()
+
+	// No thinking/tool/text events at all for a while — if a ticker were
+	// active it would fire several times in this window.
+	time.Sleep(150 * time.Millisecond)
+	sess.events <- Event{Type: EventResult, Content: "final answer", Done: true}
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("turn did not complete in time")
+	}
+
+	edits := p.getPreviewEdits()
+	starts := p.getPreviewStarts()
+	all := append(append([]string{}, starts...), edits...)
+	for _, u := range all {
+		if elapsedTickerPattern.MatchString(u) {
+			t.Errorf("compact mode should never show an elapsed-time ticker, got %q", u)
+		}
 	}
 }
