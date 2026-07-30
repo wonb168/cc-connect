@@ -863,11 +863,21 @@ func TestRichCardModeKeepsToolStepsAndFinalMetadataInOneCard(t *testing.T) {
 	if len(texts) != 0 || len(starts) != 1 || len(updates) == 0 || len(deletes) != 0 {
 		t.Fatalf("rich lifecycle = texts:%#v starts:%#v updates:%#v deletes:%#v, want one editable rich card", texts, starts, updates, deletes)
 	}
+	// The tool step must be visible DURING streaming (transient tool-title area).
+	allUpdates := strings.Join(updates, "\n---\n")
+	if !strings.Contains(allUpdates, "step=Bash") {
+		t.Fatalf("expected the Bash tool step to appear in a streaming update; got %q", allUpdates)
+	}
+	// Transient tool titles (requirement 2, Q17甲): the FINAL done card carries
+	// the body + footer but NO tool rows (they leave no trace once the turn ends).
 	final := updates[len(updates)-1]
-	for _, want := range []string{"status=done", "step=Bash", "rich output", "markdown=rich final", "[ctx: ~14%] · glm-5.1"} {
+	for _, want := range []string{"status=done", "markdown=rich final", "[ctx: ~14%] · glm-5.1"} {
 		if !strings.Contains(final, want) {
 			t.Fatalf("final rich card = %q, want contains %q", final, want)
 		}
+	}
+	if strings.Contains(final, "step=Bash") {
+		t.Fatalf("final rich card must not retain tool rows (transient tool titles), got %q", final)
 	}
 }
 
