@@ -49,6 +49,69 @@ func TestHandleResultParsesUsage(t *testing.T) {
 	}
 }
 
+// TestHandleResultParsesCost verifies that total_cost_usd from the CLI result
+// event is carried on the emitted EventResult and cached for CostReporter.
+func TestHandleResultParsesCost(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cs := &claudeSession{
+		events: make(chan core.Event, 8),
+		ctx:    ctx,
+	}
+	cs.sessionID.Store("test-session")
+	cs.alive.Store(true)
+
+	raw := map[string]any{
+		"type":           "result",
+		"result":         "done",
+		"session_id":     "test-session",
+		"total_cost_usd": float64(0.0421),
+		"usage": map[string]any{
+			"output_tokens": float64(2000),
+		},
+	}
+
+	cs.handleResult(raw)
+
+	evt := <-cs.events
+	if evt.CostUSD != 0.0421 {
+		t.Errorf("CostUSD = %v, want 0.0421", evt.CostUSD)
+	}
+	if got := cs.GetLastCostUSD(); got != 0.0421 {
+		t.Errorf("GetLastCostUSD() = %v, want 0.0421", got)
+	}
+}
+
+// TestHandleResultNoCostIsUnknown verifies that a result without
+// total_cost_usd leaves cost at 0 (unknown) rather than fabricating a value.
+func TestHandleResultNoCostIsUnknown(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cs := &claudeSession{
+		events: make(chan core.Event, 8),
+		ctx:    ctx,
+	}
+	cs.sessionID.Store("test-session")
+	cs.alive.Store(true)
+
+	cs.handleResult(map[string]any{
+		"type":       "result",
+		"result":     "done",
+		"session_id": "test-session",
+		"usage":      map[string]any{"output_tokens": float64(10)},
+	})
+
+	evt := <-cs.events
+	if evt.CostUSD != 0 {
+		t.Errorf("CostUSD = %v, want 0 (unknown)", evt.CostUSD)
+	}
+	if got := cs.GetLastCostUSD(); got != 0 {
+		t.Errorf("GetLastCostUSD() = %v, want 0", got)
+	}
+}
+
 // TestHandleResultCompactionSubtypeIsNotTerminal is a regression test for
 // issue #481: Claude Code's mid-turn context compaction emits a
 // `type:"result"` event with `subtype:"compact"` (newer CLI) or

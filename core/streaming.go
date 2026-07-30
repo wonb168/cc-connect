@@ -71,6 +71,10 @@ type ToolStep struct {
 	ExitCode *int         // optional process exit code
 	Success  *bool        // optional success flag
 	Done     bool         // true once a tool result has been observed
+	// Count is how many consecutive same-name tool invocations this row
+	// represents (>=1). Renderers show "Name ×Count" when Count > 1. Zero is
+	// treated as 1 for backward compatibility.
+	Count int
 }
 
 // RichCardSupporter is an optional interface for platforms that can build

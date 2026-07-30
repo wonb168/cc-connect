@@ -6070,7 +6070,12 @@ func richStepDisplayName(step core.ToolStep) string {
 	if step.Kind == core.ToolStepKindThinking {
 		return "Thinking"
 	}
-	return buildToolDisplay(step.Name, step.Summary).Title
+	title := buildToolDisplay(step.Name, step.Summary).Title
+	// Show merged consecutive same-name invocations as "Title ×N".
+	if step.Count > 1 {
+		title = fmt.Sprintf("%s ×%d", title, step.Count)
+	}
+	return title
 }
 
 func richStepBody(step core.ToolStep) string {

@@ -127,6 +127,17 @@ level = "info" # debug, info, warn, error
 #                                # 在助手回复底部显示类似 Codex 的状态行（默认 true 显示）
 # hide_agent_footer = false      # Strip standalone model/token footer lines emitted by agents (default: false)
 #                                # 过滤 agent 自己混入正文的模型/token 统计 footer 行（默认 false 不过滤）
+# strip_function_calls = true    # Remove leaked <function_calls>…</function_calls> XML blocks from replies (default: true)
+#                                # 过滤混入正文的 <function_calls> 工具调用 XML(仅删除成对完整块;默认 true)
+# tool_title = true              # Rich-card transient tool titles: merge consecutive same-name tools as "Name ×N",
+#                                # clear the tool area once body text starts, leave no tool rows on the final card (default: true)
+#                                # 富卡片工具标题瞬态模式:连续同名工具合并为「Name ×N」,正文开始后清除,定稿不留痕(默认 true)
+# reply_footer_template = ""     # Override the rich-card footer layout. Non-empty replaces the built-in layout.
+#                                # Placeholders (missing values render empty): {ctx} {point} {cost_usd} {elapsed} {model} {effort} {tokens} {workdir}
+#                                # 自定义状态行模板,非空则完全覆盖默认布局;占位符缺值渲染为空串
+#                                # 例:reply_footer_template = "上下文{ctx}%-{point}点({cost_usd})-{elapsed}秒"
+# point_ratio = 1.0              # Display-only USD→point ratio for the footer cost segment ({point} = cost_usd * ratio; default 1)
+#                                # 仅影响 footer 展示的「点」换算比例(入库始终为美金原值;默认 1)
 
 # Per-project override: each [[projects]] entry may have its own [projects.display]
 # block that overrides individual fields of the global [display] block above.
@@ -142,6 +153,19 @@ level = "info" # debug, info, warn, error
 # thinking_messages = false  # Override only this field; others inherit from global
 # tool_messages = false
 # hide_agent_footer = true   # Hide agent-emitted model/token footer only for this project
+
+# Usage recorder: after every completed turn, POST a best-effort record
+# {platform, sender_id, session_key, model, token counts, cost_usd, timestamp_ms}
+# to an external microservice (e.g. one that writes to PostgreSQL). Fire-and-forget:
+# a slow/dead endpoint never blocks or delays the reply. Empty endpoint = disabled.
+# cost_usd is the CLI's authoritative total_cost_usd (0 when the provider does not report it).
+# 用量入库:每轮回复结束后,尽力(fire-and-forget)将 {平台, 提问人ID, 会话键, 模型,
+# token 明细, 消耗美金, 时间戳} POST 到外部微服务(例如写入 PostgreSQL)。端点不通不会阻塞回复。
+# endpoint 为空 = 关闭。cost_usd 采用 CLI 官方 total_cost_usd 口径(中转 provider 不报则为 0)。
+# [usage_recorder]
+# enabled = true                              # default: true (still disabled unless endpoint is set)
+# endpoint = "http://127.0.0.1:8099/usage"    # HTTP URL of the recorder microservice; empty disables
+# Per-project override is supported via [projects.usage_recorder] with the same fields.
 
 # Agent idle timeout: max minutes between consecutive agent events before
 # considering the session stuck. Set to 0 to disable the timeout entirely.

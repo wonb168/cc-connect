@@ -411,6 +411,23 @@ type Engine struct {
 	showContextIndicator bool
 	showWorkdirIndicator bool
 	replyFooterEnabled   bool
+	// replyFooterTemplate, when non-empty, fully overrides the rich-card footer
+	// layout via renderFooterTemplate. Empty = built-in layout.
+	replyFooterTemplate string
+	// pointRatio converts total_cost_usd into the footer's "point" display unit
+	// ({point} = cost_usd * pointRatio). Display-only; defaults to 1.
+	pointRatio float64
+	// stripFunctionCalls removes leaked tool-call XML blocks from assistant text
+	// before it is shown. Default true.
+	stripFunctionCalls bool
+	// toolTitleTransient enables the transient tool-title behavior for rich
+	// cards: consecutive same-name tools merge into "Name ×N", the tool area is
+	// cleared once body text starts, and the finalized card keeps no tool rows.
+	// Default true. When false, the upstream toolSteps behavior is preserved.
+	toolTitleTransient bool
+	// usageRecorderEndpoint, when non-empty, receives a best-effort POST of each
+	// completed turn's usage + cost (fire-and-forget). Empty = disabled.
+	usageRecorderEndpoint string
 
 	// When true, /list etc. only show sessions tracked by cc-connect,
 	// hiding sessions created by direct CLI usage in the same work_dir.
@@ -736,6 +753,9 @@ func NewEngine(name string, ag Agent, platforms []Platform, sessionStorePath str
 		maxQueuedMessages:     defaultMaxQueuedMessages,
 		showContextIndicator:  true,
 		showWorkdirIndicator:  true,
+		pointRatio:            1,
+		stripFunctionCalls:    true,
+		toolTitleTransient:    true,
 		shell:                 defaultShell(),
 		shellFlag:             defaultShellFlag(),
 		pendingRestartTimeout: defaultPendingRestartTimeout,
@@ -961,6 +981,80 @@ func (e *Engine) SetShowWorkdirIndicator(show bool) {
 // no-ops.
 func (e *Engine) SetReplyFooterEnabled(show bool) {
 	e.replyFooterEnabled = show
+}
+
+// SetReplyFooterTemplate sets an optional template that fully overrides the
+// rich-card footer layout. Empty string restores the built-in layout.
+func (e *Engine) SetReplyFooterTemplate(tmpl string) {
+	e.replyFooterTemplate = tmpl
+}
+
+// SetPointRatio sets the USD→point display ratio for the reply footer's cost
+// segment. Non-positive values are ignored (ratio stays at its default of 1).
+func (e *Engine) SetPointRatio(ratio float64) {
+	if ratio > 0 {
+		e.pointRatio = ratio
+	}
+}
+
+// SetStripFunctionCalls toggles removal of leaked tool-call XML blocks from
+// assistant-visible text. Default true.
+func (e *Engine) SetStripFunctionCalls(enabled bool) {
+	e.stripFunctionCalls = enabled
+}
+
+// SetToolTitleTransient toggles the transient tool-title rendering (merge
+// consecutive same-name tools, clear on body text, no rows in the final card).
+// Default true.
+func (e *Engine) SetToolTitleTransient(enabled bool) {
+	e.toolTitleTransient = enabled
+}
+
+// appendToolStep appends a tool progress row, merging into the previous row's
+// Count when transient tool titles are enabled and the previous row is a tool
+// of the same name (Q15/Q18甲: consecutive same-name tools coalesce). Returns
+// the updated slice.
+func (e *Engine) appendToolStep(steps []ToolStep, name, summary string) []ToolStep {
+	if e.toolTitleTransient && len(steps) > 0 {
+		last := &steps[len(steps)-1]
+		if last.Kind == ToolStepKindTool && last.Name == name {
+			if last.Count < 1 {
+				last.Count = 1
+			}
+			last.Count++
+			if summary != "" {
+				last.Summary = summary
+			}
+			return steps
+		}
+	}
+	return append(steps, ToolStep{
+		Kind:    ToolStepKindTool,
+		Name:    name,
+		Summary: summary,
+		Count:   1,
+	})
+}
+
+// finalToolSteps returns the tool rows to render on the FINALIZED card. With
+// transient tool titles enabled the final card keeps no rows (Q17甲: the tool
+// area leaves no trace once the turn is done); otherwise the accumulated steps
+// are preserved (upstream behavior).
+func (e *Engine) finalToolSteps(steps []ToolStep) []ToolStep {
+	if e.toolTitleTransient {
+		return nil
+	}
+	return steps
+}
+
+// sanitizeAssistantText applies the fork's assistant-text sanitizers (currently
+// just function-call leak removal) when enabled. Central helper so both the
+// streaming and finalize paths behave identically.
+func (e *Engine) sanitizeAssistantText(s string) string {
+	if e.stripFunctionCalls {
+		s = StripFunctionCalls(s)
+	}
+	return s
 }
 
 // SetFilterExternalSessions controls whether /list, /switch, /delete, etc.
@@ -4921,6 +5015,10 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 		}
 		richMarkdownResolver, hasRichMarkdownResolver := p.(RichCardMarkdownResolver)
 		resolveRichCardMarkdown := func(markdown string, final bool) string {
+			// Strip leaked tool-call XML on every frame (Q14乙: best-effort on
+			// streaming frames — unclosed fragments may flash briefly; the final
+			// frame is guaranteed clean once the closing tag has arrived).
+			markdown = e.sanitizeAssistantText(markdown)
 			if !hasRichMarkdownResolver || markdown == "" {
 				return markdown
 			}
@@ -5030,11 +5128,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				if !e.display.ToolMessages {
 					break
 				}
-				toolSteps = append(toolSteps, ToolStep{
-					Kind:    ToolStepKindTool,
-					Name:    event.ToolName,
-					Summary: truncateIf(event.ToolInput, e.display.ToolMaxLen),
-				})
+				toolSteps = e.appendToolStep(toolSteps, event.ToolName, truncateIf(event.ToolInput, e.display.ToolMaxLen))
 				if cardMessageID == nil {
 					card := buildResolvedRichCard(CardStatusWorking, "", toolSteps, partialText, true, e.composeRichStatusFooter(true, turnStart, e.agent, state.agentSession, state.workspaceDir))
 					if starter, ok := p.(PreviewStarter); ok {
@@ -5244,6 +5338,15 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 						} else if !silentHold {
 							sp.setStatus(CardStatusWorking)
 						}
+					}
+					// Transient tool titles (Q16乙/Q18甲): the moment VISIBLE body
+					// text starts, collapse the tool-title area and reset the merge
+					// counters. Subsequent tool calls re-accumulate a fresh area.
+					// Gated on !silentHold so a silent NO_REPLY marker does not wipe
+					// the tool rows the silent-finalize path still needs to keep the
+					// card alive instead of deleting it.
+					if e.toolTitleTransient && hasRichCard && !silentHold && partialText == "" && len(toolSteps) > 0 {
+						toolSteps = nil
 					}
 					textParts = append(textParts, content)
 					partialText += content
@@ -5479,6 +5582,9 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			} else if fullResponse == "" && len(textParts) > 0 {
 				fullResponse = strings.Join(textParts, "")
 			}
+			// Finalize-time guarantee (Q14乙): the delivered body must be free of
+			// leaked tool-call XML even if a streaming frame flashed a fragment.
+			fullResponse = e.sanitizeAssistantText(fullResponse)
 			if fullResponse == "" {
 				fullResponse = e.i18n.T(MsgEmptyResponse)
 			}
@@ -5595,6 +5701,11 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				)
 			}
 
+			// Best-effort, non-blocking usage/cost record to the external
+			// recorder (no-op when unconfigured). Uses sessionKey for stable
+			// platform+sender identity (Q7甲).
+			e.recordUsage(sessionKey, replyFooterModel(state.agentSession, e.agent), event, time.Now())
+
 			e.noteUserTurnCompleted(state)
 
 			normalizedBaseResponse := strings.TrimSpace(baseResponse)
@@ -5659,7 +5770,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 						silentBody = strings.TrimRight(stripped, " \t\r\n")
 					}
 					if silentBody != "" || len(toolSteps) > 0 {
-						card := buildResolvedRichCard(CardStatusDone, "", toolSteps, silentBody, false, e.composeRichStatusFooter(false, turnStart, e.agent, state.agentSession, state.workspaceDir))
+						card := buildResolvedRichCard(CardStatusDone, "", e.finalToolSteps(toolSteps), silentBody, false, e.composeRichStatusFooter(false, turnStart, e.agent, state.agentSession, state.workspaceDir))
 						if updater, ok := p.(MessageUpdater); ok {
 							if err := updater.UpdateMessage(e.ctx, cardMessageID, card); err != nil {
 								slog.Debug("rich card: failed to finalize card on silent reply", "platform", p.Name(), "error", err)
@@ -5685,7 +5796,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 					richStatusFooter = formatElapsed(time.Since(turnStart), false, e.i18n.currentLang()) + "\n" + legacyStatusFooter
 				}
 				finalBody := resolveRichCardMarkdown(parts[0], true)
-				finalCard := richCardSupporter.BuildRichCard(CardStatusDone, "", toolSteps, finalBody, false, richStatusFooter)
+				finalCard := richCardSupporter.BuildRichCard(CardStatusDone, "", e.finalToolSteps(toolSteps), finalBody, false, richStatusFooter)
 				if cardMessageID != nil {
 					// Forced final flush via cardkit-v1 streaming text update before
 					// flipping status to Done via full-card Patch. The throttle in the
@@ -5966,7 +6077,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			state.eventsNeedResync = true
 			state.mu.Unlock()
 			if hasRichCard && cardMessageID != nil {
-				errCard := buildResolvedRichCard(CardStatusError, "", toolSteps, partialText, false, e.composeRichStatusFooter(false, turnStart, e.agent, state.agentSession, state.workspaceDir))
+				errCard := buildResolvedRichCard(CardStatusError, "", e.finalToolSteps(toolSteps), partialText, false, e.composeRichStatusFooter(false, turnStart, e.agent, state.agentSession, state.workspaceDir))
 				if updater, ok := p.(MessageUpdater); ok {
 					if err := updater.UpdateMessage(e.ctx, cardMessageID, errCard); err != nil {
 						slog.Debug("rich card: failed to update error card", "platform", p.Name(), "error", err)
@@ -7122,17 +7233,32 @@ func (e *Engine) composeRichStatusFooter(streaming bool, turnStart time.Time, ag
 	if streaming {
 		return ""
 	}
+
+	elapsed := formatElapsed(time.Since(turnStart), streaming, e.i18n.currentLang())
+	usage := replyFooterSessionContextUsage(session)
+	model := replyFooterModel(session, agent)
+	effort := replyFooterReasoningEffort(session, agent)
+	costUSD := replyFooterSessionCostUSD(session)
+	costSeg := formatCostSegment(costUSD, e.pointRatio, e.i18n)
+
+	// Template override: when a footer template is configured, it fully
+	// replaces the built-in layout. Missing placeholders render empty.
+	if e.replyFooterTemplate != "" {
+		return renderFooterTemplate(e.replyFooterTemplate, e.footerTemplateVars(
+			elapsed, model, effort, costUSD, costSeg, usage, session, agent, workspaceDir))
+	}
+
 	var lines []string
 
 	// Line 1: elapsed timer (now always the "done" form since streaming branch returned above)
-	lines = append(lines, formatElapsed(time.Since(turnStart), streaming, e.i18n.currentLang()))
+	lines = append(lines, elapsed)
 
-	// Line 2: model + effort + token usage detail + ctx %
+	// Line 2: model + effort + token usage detail + ctx % + cost
 	if e.showContextIndicator {
-		usage := replyFooterSessionContextUsage(session)
-		model := replyFooterModel(session, agent)
-		effort := replyFooterReasoningEffort(session, agent)
 		if line := buildClaudeStatusLineFooter(model, effort, usage); line != "" {
+			if costSeg != "" {
+				line += " · " + costSeg
+			}
 			lines = append(lines, line)
 		} else if fallback := e.replyFooterUsageText(session, agent); fallback != "" {
 			// fallback for non-claudecode agents that still expose UsageReporter
@@ -7144,6 +7270,9 @@ func (e *Engine) composeRichStatusFooter(streaming bool, turnStart time.Time, ag
 				parts = append(parts, effort)
 			}
 			parts = append(parts, fallback)
+			if costSeg != "" {
+				parts = append(parts, costSeg)
+			}
 			lines = append(lines, strings.Join(parts, " · "))
 		}
 	}
@@ -7376,6 +7505,102 @@ func replyFooterSessionContextUsage(session AgentSession) *ContextUsage {
 		return nil
 	}
 	return reporter.GetContextUsage()
+}
+
+// replyFooterSessionCostUSD returns the most recent turn cost in USD, or 0 when
+// the session cannot report it (non-claudecode agents, relay providers). 0 is
+// treated as "unknown" by callers and the cost segment is omitted.
+func replyFooterSessionCostUSD(session AgentSession) float64 {
+	if session == nil {
+		return 0
+	}
+	reporter, ok := session.(CostReporter)
+	if !ok {
+		return 0
+	}
+	return reporter.GetLastCostUSD()
+}
+
+// formatCostSegment renders the footer cost segment "<point>点(<$cost>)" from a
+// USD cost and the display point ratio. Returns "" when cost is unknown (<=0).
+// The point value drops trailing zeros; the USD value keeps up to 4 decimals.
+func formatCostSegment(costUSD, pointRatio float64, i18n *I18n) string {
+	if costUSD <= 0 {
+		return ""
+	}
+	if pointRatio <= 0 {
+		pointRatio = 1
+	}
+	point := costUSD * pointRatio
+	pointStr := strconv.FormatFloat(point, 'f', -1, 64)
+	costStr := strconv.FormatFloat(costUSD, 'f', -1, 64)
+	if i18n != nil {
+		return i18n.Tf(MsgReplyFooterCost, pointStr, costStr)
+	}
+	return fmt.Sprintf("%s点($%s)", pointStr, costStr)
+}
+
+// renderFooterTemplate performs plain placeholder substitution on a footer
+// template. Missing values render as empty string (Q11: simplest behavior).
+// Recognised placeholders: {ctx} {point} {cost_usd} {elapsed} {model}
+// {effort} {tokens} {workdir}.
+func renderFooterTemplate(tmpl string, vars map[string]string) string {
+	out := tmpl
+	for k, v := range vars {
+		out = strings.ReplaceAll(out, "{"+k+"}", v)
+	}
+	return out
+}
+
+// footerTemplateVars builds the placeholder map for renderFooterTemplate.
+// Values that are unknown/missing map to "" so they disappear from the output.
+func (e *Engine) footerTemplateVars(elapsed, model, effort string, costUSD float64, costSeg string, usage *ContextUsage, session AgentSession, agent Agent, workspaceDir string) map[string]string {
+	vars := map[string]string{
+		"elapsed":  strings.TrimSpace(strings.TrimPrefix(elapsed, "⏱")),
+		"model":    model,
+		"effort":   effort,
+		"cost_usd": "",
+		"point":    "",
+		"ctx":      "",
+		"tokens":   "",
+		"workdir":  replyFooterWorkDir(session, agent, workspaceDir),
+	}
+	if costUSD > 0 {
+		ratio := e.pointRatio
+		if ratio <= 0 {
+			ratio = 1
+		}
+		vars["cost_usd"] = strconv.FormatFloat(costUSD, 'f', -1, 64)
+		vars["point"] = strconv.FormatFloat(costUSD*ratio, 'f', -1, 64)
+	}
+	if usage != nil && usage.ContextWindow > 0 {
+		used := usage.UsedTokens
+		if used <= 0 && usage.TotalTokens > 0 {
+			used = usage.TotalTokens
+		}
+		if used > 0 {
+			pct := used * 100 / usage.ContextWindow
+			if pct > 100 {
+				pct = 100
+			}
+			vars["ctx"] = strconv.Itoa(pct)
+		}
+		var counts []string
+		if usage.OutputTokens > 0 {
+			counts = append(counts, fmt.Sprintf("out %s", formatStatusTokenCount(usage.OutputTokens)))
+		}
+		if usage.InputTokens > 0 {
+			counts = append(counts, fmt.Sprintf("in %s", formatStatusTokenCount(usage.InputTokens)))
+		}
+		if usage.CacheCreationInputTokens > 0 {
+			counts = append(counts, fmt.Sprintf("cw %s", formatStatusTokenCount(usage.CacheCreationInputTokens)))
+		}
+		if usage.CachedInputTokens > 0 {
+			counts = append(counts, fmt.Sprintf("cr %s", formatStatusTokenCount(usage.CachedInputTokens)))
+		}
+		vars["tokens"] = strings.Join(counts, " ")
+	}
+	return vars
 }
 
 func replyFooterContextText(usage *ContextUsage, i18n *I18n) string {

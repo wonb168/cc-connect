@@ -297,6 +297,7 @@ const (
 
 	MsgStatusTitle           MsgKey = "status_title"
 	MsgReplyFooterRemaining  MsgKey = "reply_footer_remaining"
+	MsgReplyFooterCost       MsgKey = "reply_footer_cost"
 	MsgModelCurrent          MsgKey = "model_current"
 	MsgModelChanged          MsgKey = "model_changed"
 	MsgModelChangeFailed     MsgKey = "model_change_failed"
@@ -2193,6 +2194,14 @@ var messages = map[MsgKey]map[Language]string{
 		LangTraditionalChinese: "剩餘 %d%%",
 		LangJapanese:           "残り %d%%",
 		LangSpanish:            "%d%% restante",
+	},
+	// %s = display points, %s = raw USD amount. Format: "<point>点($<cost>)".
+	MsgReplyFooterCost: {
+		LangEnglish:            "%s pt ($%s)",
+		LangChinese:            "%s 点 ($%s)",
+		LangTraditionalChinese: "%s 點 ($%s)",
+		LangJapanese:           "%s pt ($%s)",
+		LangSpanish:            "%s pt ($%s)",
 	},
 	MsgModelCurrent: {
 		LangEnglish:            "Current model: %s",

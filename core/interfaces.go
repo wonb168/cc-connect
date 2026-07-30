@@ -547,6 +547,14 @@ type ContextUsageReporter interface {
 	GetContextUsage() *ContextUsage
 }
 
+// CostReporter is an optional interface for running agent sessions that can
+// report the monetary cost (USD) of the most recent turn. Agents that do not
+// implement it (or return 0) are treated as "cost unknown" — the reply footer
+// and usage recorder omit the cost figure rather than estimating it.
+type CostReporter interface {
+	GetLastCostUSD() float64
+}
+
 // ContextUsage describes runtime context consumption for the active session.
 type ContextUsage struct {
 	// UsedTokens is the current token load to compare against ContextWindow when

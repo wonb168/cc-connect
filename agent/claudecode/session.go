@@ -49,9 +49,11 @@ type claudeSession struct {
 	// configured model.
 	activeModel atomic.Value // stores string
 
-	// usageMu guards lastUsage. Populated from the most recent result event.
-	usageMu   sync.Mutex
-	lastUsage *core.ContextUsage
+	// usageMu guards lastUsage and lastCostUSD. Populated from the most
+	// recent result event.
+	usageMu     sync.Mutex
+	lastUsage   *core.ContextUsage
+	lastCostUSD float64 // total_cost_usd from the most recent turn result; 0 = unknown
 
 	// gracefulStopTimeout is how long Close() waits for a clean exit
 	// (stdin close → Stop hooks → process exit) before escalating to
@@ -827,11 +829,26 @@ func (cs *claudeSession) handleResult(raw map[string]any) {
 	if usage, ok := raw["usage"].(map[string]any); ok {
 		inputTokens, outputTokens, cacheCreationTokens, cacheReadTokens = parseClaudeUsage(usage)
 	}
-	if outputTokens > 0 {
+
+	// total_cost_usd is the CLI's authoritative per-turn billing figure
+	// (already accounts for cache-write / cache-read price tiers). It is the
+	// single source of truth for cost, used both for the reply footer and for
+	// usage recording. A missing/zero value means "cost unknown" (e.g. a
+	// relay provider that does not report billing) — we never estimate it from
+	// token counts.
+	var costUSD float64
+	if v, ok := raw["total_cost_usd"].(float64); ok {
+		costUSD = v
+	}
+
+	if outputTokens > 0 || costUSD > 0 {
 		cs.usageMu.Lock()
-		if cs.lastUsage != nil {
+		if outputTokens > 0 && cs.lastUsage != nil {
 			cs.lastUsage.OutputTokens = outputTokens
 			cs.lastUsage.TotalTokens = cs.lastUsage.UsedTokens + outputTokens
+		}
+		if costUSD > 0 {
+			cs.lastCostUSD = costUSD
 		}
 		cs.usageMu.Unlock()
 	}
@@ -845,6 +862,7 @@ func (cs *claudeSession) handleResult(raw map[string]any) {
 		OutputTokens:             outputTokens,
 		CacheCreationInputTokens: cacheCreationTokens,
 		CacheReadInputTokens:     cacheReadTokens,
+		CostUSD:                  costUSD,
 	}
 	select {
 	case cs.events <- evt:
@@ -1162,6 +1180,14 @@ func (cs *claudeSession) GetContextUsage() *core.ContextUsage {
 	}
 	clone := *cs.lastUsage
 	return &clone
+}
+
+// GetLastCostUSD returns the total_cost_usd from the most recent turn result,
+// or 0 if unknown / not yet observed. Implements core.CostReporter.
+func (cs *claudeSession) GetLastCostUSD() float64 {
+	cs.usageMu.Lock()
+	defer cs.usageMu.Unlock()
+	return cs.lastCostUSD
 }
 
 func (cs *claudeSession) Alive() bool {

@@ -100,6 +100,7 @@ type Config struct {
 	Speech             SpeechConfig            `toml:"speech"`
 	TTS                TTSConfig               `toml:"tts"`
 	Display            DisplayConfig           `toml:"display"`
+	UsageRecorder      UsageRecorderConfig     `toml:"usage_recorder"`      // outbound per-turn usage/cost recording
 	StreamPreview      StreamPreviewConfig     `toml:"stream_preview"`      // real-time streaming preview
 	InstantReply       InstantReplyConfig      `toml:"instant_reply"`       // immediate confirmation reply
 	RateLimit          RateLimitConfig         `toml:"rate_limit"`          // per-session rate limiting
@@ -202,6 +203,24 @@ type DisplayConfig struct {
 	ShowContextIndicator *bool   `toml:"show_context_indicator"` // whether [ctx: ~N%] suffix is shown; default true
 	ReplyFooter          *bool   `toml:"reply_footer"`           // whether Codex-like footer is shown; default true
 	HideAgentFooter      *bool   `toml:"hide_agent_footer"`      // strip agent-emitted model/token footer lines; default false
+
+	// ReplyFooterTemplate, when non-empty, fully overrides the rich-card reply
+	// footer layout. Placeholders (missing values render as empty string):
+	//   {ctx} {point} {cost_usd} {elapsed} {model} {effort} {tokens} {workdir}
+	ReplyFooterTemplate *string `toml:"reply_footer_template,omitempty"`
+	// PointRatio converts total_cost_usd into the display "point" unit shown in
+	// the footer ({point} = cost_usd * point_ratio). Default 1 (1 point = $1).
+	// Display-only: never affects recorded/persisted cost. Nil = default 1.
+	PointRatio *float64 `toml:"point_ratio,omitempty"`
+	// StripFunctionCalls removes leaked tool-call XML blocks
+	// (<function_calls>…</function_calls>) from assistant-visible text.
+	// Default true. Nil = default true.
+	StripFunctionCalls *bool `toml:"strip_function_calls,omitempty"`
+	// ToolTitle enables transient tool-title rendering in rich cards (merge
+	// consecutive same-name tools into "Name ×N", clear the tool area when body
+	// text starts, and keep no tool rows on the finalized card).
+	// Default true. Nil = default true.
+	ToolTitle *bool `toml:"tool_title,omitempty"`
 }
 
 // StreamPreviewConfig controls real-time streaming preview in IM.
@@ -458,6 +477,13 @@ type ObserveConfig struct {
 	Channel string `toml:"channel"`
 }
 
+// UsageRecorderConfig controls the best-effort outbound POST of per-turn usage
+// and cost to an external recorder microservice. Endpoint empty = disabled.
+type UsageRecorderConfig struct {
+	Enabled  *bool  `toml:"enabled,omitempty"`  // default true (but disabled unless Endpoint set)
+	Endpoint string `toml:"endpoint,omitempty"` // HTTP URL of the recorder; empty disables recording
+}
+
 // ReferenceConfig controls local file reference normalization and rendering.
 type ReferenceConfig struct {
 	NormalizeAgents []string `toml:"normalize_agents,omitempty"`
@@ -541,9 +567,10 @@ type ProjectConfig struct {
 	//   [projects.display]
 	//   thinking_messages = false
 	//   tool_messages = false
-	Display    *DisplayConfig  `toml:"display,omitempty"`
-	Observe    *ObserveConfig  `toml:"observe,omitempty"`
-	References ReferenceConfig `toml:"references,omitempty"`
+	Display       *DisplayConfig       `toml:"display,omitempty"`
+	Observe       *ObserveConfig       `toml:"observe,omitempty"`
+	UsageRecorder *UsageRecorderConfig `toml:"usage_recorder,omitempty"`
+	References    ReferenceConfig      `toml:"references,omitempty"`
 	// FilterExternalSessions: when true, /list only shows sessions created by
 	// cc-connect, hiding sessions created by direct CLI usage in the same work_dir.
 	// Default is false (show all sessions).
@@ -990,6 +1017,95 @@ func EffectiveCardMode(cfg *Config, proj *ProjectConfig) string {
 		}
 	}
 	return "legacy"
+}
+
+// EffectiveReplyFooterTemplate resolves the reply-footer override template:
+// project [projects.display] takes precedence over global [display]; empty when
+// neither sets it (footer uses the built-in layout).
+func EffectiveReplyFooterTemplate(cfg *Config, proj *ProjectConfig) string {
+	var projDisp *DisplayConfig
+	if proj != nil {
+		projDisp = proj.Display
+	}
+	if projDisp != nil && projDisp.ReplyFooterTemplate != nil {
+		return *projDisp.ReplyFooterTemplate
+	}
+	if cfg.Display.ReplyFooterTemplate != nil {
+		return *cfg.Display.ReplyFooterTemplate
+	}
+	return ""
+}
+
+// EffectivePointRatio resolves the USD→point display ratio for the reply
+// footer. Project [projects.display] takes precedence over global [display];
+// defaults to 1 when unset or non-positive.
+func EffectivePointRatio(cfg *Config, proj *ProjectConfig) float64 {
+	var projDisp *DisplayConfig
+	if proj != nil {
+		projDisp = proj.Display
+	}
+	if projDisp != nil && projDisp.PointRatio != nil && *projDisp.PointRatio > 0 {
+		return *projDisp.PointRatio
+	}
+	if cfg.Display.PointRatio != nil && *cfg.Display.PointRatio > 0 {
+		return *cfg.Display.PointRatio
+	}
+	return 1
+}
+
+// EffectiveStripFunctionCalls resolves whether leaked tool-call XML blocks are
+// stripped from assistant text. Project [projects.display] takes precedence
+// over global [display]; defaults to true when unset.
+func EffectiveStripFunctionCalls(cfg *Config, proj *ProjectConfig) bool {
+	var projDisp *DisplayConfig
+	if proj != nil {
+		projDisp = proj.Display
+	}
+	if projDisp != nil && projDisp.StripFunctionCalls != nil {
+		return *projDisp.StripFunctionCalls
+	}
+	if cfg.Display.StripFunctionCalls != nil {
+		return *cfg.Display.StripFunctionCalls
+	}
+	return true
+}
+
+// EffectiveUsageRecorderEndpoint resolves the outbound usage-recorder endpoint.
+// Project [projects.usage_recorder] overrides global [usage_recorder]. Returns
+// "" (disabled) when unset, when Enabled is explicitly false, or when no
+// endpoint is configured.
+func EffectiveUsageRecorderEndpoint(cfg *Config, proj *ProjectConfig) string {
+	rc := cfg.UsageRecorder
+	if proj != nil && proj.UsageRecorder != nil {
+		pr := proj.UsageRecorder
+		if pr.Endpoint != "" {
+			rc.Endpoint = pr.Endpoint
+		}
+		if pr.Enabled != nil {
+			rc.Enabled = pr.Enabled
+		}
+	}
+	if rc.Enabled != nil && !*rc.Enabled {
+		return ""
+	}
+	return rc.Endpoint
+}
+
+// EffectiveToolTitle resolves whether transient tool-title rendering is on.
+// Project [projects.display] takes precedence over global [display]; defaults
+// to true when unset.
+func EffectiveToolTitle(cfg *Config, proj *ProjectConfig) bool {
+	var projDisp *DisplayConfig
+	if proj != nil {
+		projDisp = proj.Display
+	}
+	if projDisp != nil && projDisp.ToolTitle != nil {
+		return *projDisp.ToolTitle
+	}
+	if cfg.Display.ToolTitle != nil {
+		return *cfg.Display.ToolTitle
+	}
+	return true
 }
 
 // validatePermissive is like validate but skips the "at least one platform"

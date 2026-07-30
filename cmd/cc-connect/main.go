@@ -448,6 +448,11 @@ func main() {
 		}
 		engine.SetShowWorkdirIndicator(showWorkdir)
 		engine.SetReplyFooterEnabled(showFooter)
+		engine.SetReplyFooterTemplate(config.EffectiveReplyFooterTemplate(cfg, &proj))
+		engine.SetPointRatio(config.EffectivePointRatio(cfg, &proj))
+		engine.SetStripFunctionCalls(config.EffectiveStripFunctionCalls(cfg, &proj))
+		engine.SetToolTitleTransient(config.EffectiveToolTitle(cfg, &proj))
+		engine.SetUsageRecorderEndpoint(config.EffectiveUsageRecorderEndpoint(cfg, &proj))
 		engine.SetAttachmentSendEnabled(cfg.AttachmentSend != "off")
 		engine.SetFilterExternalSessions(proj.FilterExternalSessions != nil && *proj.FilterExternalSessions)
 		engine.SetBaseWorkDir(workDir)
@@ -1731,6 +1736,11 @@ func reloadConfig(configPath, projName string, engine *core.Engine) (*core.Confi
 	}
 	engine.SetShowWorkdirIndicator(showWorkdir)
 	engine.SetReplyFooterEnabled(showFooter)
+	engine.SetReplyFooterTemplate(config.EffectiveReplyFooterTemplate(cfg, proj))
+	engine.SetPointRatio(config.EffectivePointRatio(cfg, proj))
+	engine.SetStripFunctionCalls(config.EffectiveStripFunctionCalls(cfg, proj))
+	engine.SetToolTitleTransient(config.EffectiveToolTitle(cfg, proj))
+	engine.SetUsageRecorderEndpoint(config.EffectiveUsageRecorderEndpoint(cfg, proj))
 
 	// Reload auto-compress settings
 	if proj.AutoCompress.Enabled != nil && *proj.AutoCompress.Enabled {
