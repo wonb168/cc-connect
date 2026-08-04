@@ -1047,6 +1047,8 @@ app_secret = "your-feishu-app-secret"
 #                                   # 设为 true 时，群聊内所有用户共享同一个 Agent 会话
 # thread_isolation = false  # If true, group messages use Feishu reply threads as session boundaries (one thread/root = one agent session and, in multi-workspace mode, one workspace binding)
 #                           # 设为 true 时，群聊按飞书话题/根消息隔离会话；multi-workspace 模式下每个话题也独立绑定 workspace
+# session_use_union_id = true  # Default true: key sessions (and per-chat input-file dirs) on the user's union_id (uid) so identity is stable and files isolate per chat. Set false to fall back to open_id (upstream behavior). open_id is always still used for allow_from / @mentions / name resolution.
+#                              # 默认 true：会话身份与每个群的输入文件目录按 union_id(uid) 隔离；设为 false 回退用 open_id（上游行为）。allow_from/@人/名字解析始终仍用 open_id。
 # reply_to_trigger = true   # Default: bot uses “reply to message” API (quotes the user’s message). Set false to post plain chat messages instead.
 #                           # 默认 true：用「回复消息」API（引用用户消息）。设为 false 则在会话里发普通消息、不引用触发消息。
 # progress_style = "legacy" # Progress rendering style: legacy | compact | card

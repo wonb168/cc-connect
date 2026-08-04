@@ -130,6 +130,12 @@ type Platform struct {
 	respondToAtEveryoneAndHere bool
 	shareSessionInChannel      bool
 	threadIsolation            bool
+	// sessionUseUnionID selects union_id (the in-domain uid) over open_id for
+	// the user segment of the session key. Default true. See CONTEXT.md
+	// "隔离与会话记录模型": identity is uid=union_id for isolation, while
+	// open_id stays the language for talking to the Feishu API (allow_from,
+	// @mentions, name resolution). Falls back to open_id when union_id is empty.
+	sessionUseUnionID bool
 	// noReplyToTrigger: when true, send via Create instead of Im.Message.Reply (no quote to the user's message).
 	noReplyToTrigger bool
 	resolveMentions  bool
@@ -239,6 +245,7 @@ func coerceMilliseconds(v any) (int64, error) {
 type imageBatchEntry struct {
 	sessionKey   string
 	userID       string
+	unionID      string
 	userName     string
 	chatName     string
 	rctx         replyContext
@@ -310,6 +317,12 @@ func newPlatform(name, domain string, opts map[string]any) (core.Platform, error
 	respondToAtEveryoneAndHere, _ := opts["respond_to_at_everyone_and_here"].(bool)
 	shareSessionInChannel, _ := opts["share_session_in_channel"].(bool)
 	threadIsolation, _ := opts["thread_isolation"].(bool)
+	// Default true (opt-out): use union_id as the session identity. Set
+	// session_use_union_id=false to fall back to open_id (upstream behavior).
+	sessionUseUnionID := true
+	if v, ok := opts["session_use_union_id"].(bool); ok {
+		sessionUseUnionID = v
+	}
 	resolveMentionsOpt, _ := opts["resolve_mentions"].(bool)
 	noReplyToTrigger := false
 	if v, ok := opts["reply_to_trigger"].(bool); ok && !v {
@@ -401,6 +414,7 @@ func newPlatform(name, domain string, opts map[string]any) (core.Platform, error
 		respondToAtEveryoneAndHere: respondToAtEveryoneAndHere,
 		shareSessionInChannel:      shareSessionInChannel,
 		threadIsolation:            threadIsolation,
+		sessionUseUnionID:          sessionUseUnionID,
 		resolveMentions:            resolveMentionsOpt,
 		noReplyToTrigger:           noReplyToTrigger,
 		client:                     lark.NewClient(appID, appSecret, clientOpts...),
@@ -1244,7 +1258,7 @@ func (p *Platform) dispatchImageBatchEntry(entry *imageBatchEntry) {
 	p.dispatchCoreMessage(&core.Message{
 		SessionKey: entry.sessionKey, Platform: p.platformName,
 		MessageID: canonicalID,
-		UserID:    entry.userID, UserName: entry.userName, ChatName: entry.chatName,
+		UserID:    entry.userID, UserName: entry.userName, ChatName: entry.chatName, UnionID: entry.unionID,
 		Content:           "",
 		ExtraContent:      entry.quoted.text,
 		Images:            append(entry.quoted.images, entry.images...),
@@ -1303,6 +1317,10 @@ func (p *Platform) onMessage(ctx context.Context, event *larkim.P2MessageReceive
 		chatID = *msg.ChatId
 	}
 	userID := userIDFromEvent(sender.SenderId)
+	unionID := ""
+	if sender.SenderId != nil {
+		unionID = stringValue(sender.SenderId.UnionId)
+	}
 	// userName and chatName are resolved in dispatchMessage to avoid blocking
 	// the SDK dispatcher goroutine with synchronous HTTP calls.
 
@@ -1352,7 +1370,7 @@ func (p *Platform) onMessage(ctx context.Context, event *larkim.P2MessageReceive
 
 	// Pre-compute sessionKey so the @bot filter below can consult the active
 	// thread set; sessionKey is also used downstream for dispatch.
-	sessionKey := p.makeSessionKey(msg, chatID, userID)
+	sessionKey := p.makeSessionKey(msg, chatID, userID, unionID)
 
 	if chatType == "group" && !p.groupReplyAll && p.getBotOpenID() != "" {
 		if !isBotMentioned(msg.Mentions, p.getBotOpenID()) {
@@ -1418,7 +1436,7 @@ func (p *Platform) onMessage(ctx context.Context, event *larkim.P2MessageReceive
 	// blocked by IO-heavy operations (image/audio download, handler HTTP calls).
 	// The dedup and old-message checks above remain synchronous to guarantee
 	// correctness before spawning the goroutine.
-	go p.dispatchMessage(ctx, msgType, content, mentions, messageID, sessionKey, userID, chatID, rctx, parentID, createTimeMs)
+	go p.dispatchMessage(ctx, msgType, content, mentions, messageID, sessionKey, userID, unionID, chatID, rctx, parentID, createTimeMs)
 
 	return nil
 }
@@ -1435,7 +1453,7 @@ func (p *Platform) replyUnauthorizedAccess(ctx context.Context, rctx replyContex
 // dispatchMessage handles the message content parsing, media download, and
 // handler invocation. It runs in its own goroutine so that onMessage returns
 // quickly and does not block the SDK event loop.
-func (p *Platform) dispatchMessage(ctx context.Context, msgType, content string, mentions []*larkim.MentionEvent, messageID, sessionKey, userID, chatID string, rctx replyContext, parentID string, createTimeMs int64) {
+func (p *Platform) dispatchMessage(ctx context.Context, msgType, content string, mentions []*larkim.MentionEvent, messageID, sessionKey, userID, unionID, chatID string, rctx replyContext, parentID string, createTimeMs int64) {
 	if p.isMessageRecalled(messageID) {
 		slog.Debug(p.tag()+": recalled message ignored in async dispatch", "message_id", messageID)
 		return
@@ -1479,7 +1497,7 @@ func (p *Platform) dispatchMessage(ctx context.Context, msgType, content string,
 		p.dispatchCoreMessage(&core.Message{
 			SessionKey: sessionKey, Platform: p.platformName,
 			MessageID: messageID,
-			UserID:    userID, UserName: userName, ChatName: chatName,
+			UserID:    userID, UserName: userName, ChatName: chatName, UnionID: unionID,
 			Content: text, ExtraContent: quoted.text, Images: quoted.images, ReplyCtx: rctx,
 			UserMessageTimeMs: createTimeMs,
 		})
@@ -1511,6 +1529,7 @@ func (p *Platform) dispatchMessage(ctx context.Context, msgType, content string,
 			p.bufferImage(sessionKey, &imageBatchEntry{
 				sessionKey:   sessionKey,
 				userID:       userID,
+				unionID:      unionID,
 				userName:     userName,
 				chatName:     chatName,
 				rctx:         rctx,
@@ -1524,7 +1543,7 @@ func (p *Platform) dispatchMessage(ctx context.Context, msgType, content string,
 		p.dispatchCoreMessage(&core.Message{
 			SessionKey: sessionKey, Platform: p.platformName,
 			MessageID: messageID,
-			UserID:    userID, UserName: userName, ChatName: chatName,
+			UserID:    userID, UserName: userName, ChatName: chatName, UnionID: unionID,
 			Content:           "",
 			ExtraContent:      quoted.text,
 			Images:            append(quoted.images, core.ImageAttachment{MimeType: mimeType, Data: imgData}),
@@ -1553,7 +1572,7 @@ func (p *Platform) dispatchMessage(ctx context.Context, msgType, content string,
 		p.dispatchCoreMessage(&core.Message{
 			SessionKey: sessionKey, Platform: p.platformName,
 			MessageID: messageID,
-			UserID:    userID, UserName: userName, ChatName: chatName,
+			UserID:    userID, UserName: userName, ChatName: chatName, UnionID: unionID,
 			Audio: &core.AudioAttachment{
 				MimeType: "audio/opus",
 				Data:     audioData,
@@ -1573,7 +1592,7 @@ func (p *Platform) dispatchMessage(ctx context.Context, msgType, content string,
 		p.dispatchCoreMessage(&core.Message{
 			SessionKey: sessionKey, Platform: p.platformName,
 			MessageID: messageID,
-			UserID:    userID, UserName: userName, ChatName: chatName,
+			UserID:    userID, UserName: userName, ChatName: chatName, UnionID: unionID,
 			Content: text, ExtraContent: quoted.text, Images: append(quoted.images, images...),
 			ReplyCtx:          rctx,
 			UserMessageTimeMs: createTimeMs,
@@ -1602,7 +1621,7 @@ func (p *Platform) dispatchMessage(ctx context.Context, msgType, content string,
 		p.dispatchCoreMessage(&core.Message{
 			SessionKey: sessionKey, Platform: p.platformName,
 			MessageID: messageID,
-			UserID:    userID, UserName: userName, ChatName: chatName,
+			UserID:    userID, UserName: userName, ChatName: chatName, UnionID: unionID,
 			Files: []core.FileAttachment{{
 				MimeType: mimeType,
 				Data:     fileData,
@@ -1621,7 +1640,7 @@ func (p *Platform) dispatchMessage(ctx context.Context, msgType, content string,
 		coreMsg := &core.Message{
 			SessionKey: sessionKey, Platform: p.platformName,
 			MessageID: messageID,
-			UserID:    userID, UserName: userName, ChatName: chatName,
+			UserID:    userID, UserName: userName, ChatName: chatName, UnionID: unionID,
 			Content:           text,
 			Images:            images,
 			Files:             files,
@@ -1645,7 +1664,7 @@ func (p *Platform) dispatchMessage(ctx context.Context, msgType, content string,
 			p.dispatchCoreMessage(&core.Message{
 				SessionKey: sessionKey, Platform: p.platformName,
 				MessageID: messageID,
-				UserID:    userID, UserName: userName, ChatName: chatName,
+				UserID:    userID, UserName: userName, ChatName: chatName, UnionID: unionID,
 				Content: "[sticker]", ExtraContent: quoted.text, ReplyCtx: rctx,
 				UserMessageTimeMs: createTimeMs,
 			})
@@ -1654,7 +1673,7 @@ func (p *Platform) dispatchMessage(ctx context.Context, msgType, content string,
 		p.dispatchCoreMessage(&core.Message{
 			SessionKey: sessionKey, Platform: p.platformName,
 			MessageID: messageID,
-			UserID:    userID, UserName: userName, ChatName: chatName,
+			UserID:    userID, UserName: userName, ChatName: chatName, UnionID: unionID,
 			Images:            []core.ImageAttachment{{MimeType: mimeType, Data: imgData}},
 			ReplyCtx:          rctx,
 			UserMessageTimeMs: createTimeMs,
@@ -1691,7 +1710,7 @@ func (p *Platform) dispatchMessage(ctx context.Context, msgType, content string,
 		p.dispatchCoreMessage(&core.Message{
 			SessionKey: sessionKey, Platform: p.platformName,
 			MessageID: messageID,
-			UserID:    userID, UserName: userName, ChatName: chatName,
+			UserID:    userID, UserName: userName, ChatName: chatName, UnionID: unionID,
 			Content: text, ExtraContent: quoted.text, Images: images, ReplyCtx: rctx,
 			UserMessageTimeMs: createTimeMs,
 		})
@@ -3372,7 +3391,12 @@ func stripMentions(text string, mentions []*larkim.MentionEvent, botOpenID strin
 
 // TODO: Session-key derivation and reply-thread behavior are split across multiple code paths here.
 // Should revisit thread/root handling without changing thread_isolation=false behavior.
-func (p *Platform) makeSessionKey(msg *larkim.EventMessage, chatID, userID string) string {
+//
+// The default (per-user-in-chat) branch keys on uid: union_id when available
+// and enabled, else open_id. open_id remains the identity for Feishu API calls
+// (allow_from, @mentions, name resolution) — those are intentionally not routed
+// through here. See CONTEXT.md "隔离与会话记录模型".
+func (p *Platform) makeSessionKey(msg *larkim.EventMessage, chatID, userID, unionID string) string {
 	if p.threadIsolation && msg != nil && stringValue(msg.ChatType) == "group" {
 		rootID := stringValue(msg.RootId)
 		if rootID == "" {
@@ -3385,7 +3409,11 @@ func (p *Platform) makeSessionKey(msg *larkim.EventMessage, chatID, userID strin
 	if p.shareSessionInChannel {
 		return fmt.Sprintf("%s:%s", p.tag(), chatID)
 	}
-	return fmt.Sprintf("%s:%s:%s", p.tag(), chatID, userID)
+	uid := userID
+	if p.sessionUseUnionID && unionID != "" {
+		uid = unionID
+	}
+	return fmt.Sprintf("%s:%s:%s", p.tag(), chatID, uid)
 }
 
 func (p *Platform) sessionKeyFromCardAction(chatID, userID string, value map[string]any) string {
@@ -6175,11 +6203,16 @@ func richLaneTitle(label string, count int) string {
 }
 
 func richStepRowContent(step core.ToolStep) string {
-	body := richStepBody(step)
 	if step.Kind == core.ToolStepKindThinking {
-		return body
+		return richStepBody(step)
 	}
 	name := richStepDisplayName(step)
+	// Transient tool titles: show only the title (e.g. "Bash ×3"), omit the
+	// body (command/args/output). Applies to tool rows only.
+	if step.TitleOnly {
+		return name
+	}
+	body := richStepBody(step)
 	if body == name || strings.HasPrefix(body, name+"\n") {
 		return body
 	}

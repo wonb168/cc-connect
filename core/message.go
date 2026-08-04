@@ -132,24 +132,31 @@ type FileAttachment struct {
 //	collisions but does not protect against concurrent calls racing on the
 //	same name — that case is fixed only when messageID is provided.
 func SaveFilesToDisk(workDir, messageID string, files []FileAttachment) []string {
+	return SaveFilesToBaseDir(filepath.Join(workDir, ".cc-connect", "attachments"), messageID, files)
+}
+
+// SaveFilesToBaseDir is the base-dir-aware core of SaveFilesToDisk. It writes
+// attachments under baseDir (per-message subdir when messageID is set) and
+// returns their absolute paths. Callers that need per-chat/per-user scoping
+// (see SessionScope) pass a scoped baseDir such as
+// "<workDir>/Chat/<chatID>/Inputs"; SaveFilesToDisk passes the legacy
+// "<workDir>/.cc-connect/attachments" root for back-compat.
+func SaveFilesToBaseDir(baseDir, messageID string, files []FileAttachment) []string {
 	if len(files) == 0 {
 		return nil
 	}
-	// Absolutize workDir so the returned paths are usable no matter where the
-	// process is invoked from. See issue #1459: when workDir is relative
-	// (e.g. ".cc-connect" or "project/sub"), the agent's prompt referenced
-	// ".cc-connect/attachments/<file>" while the file actually landed at
-	// workDir/.cc-connect/attachments/<file> — a path mismatch that lost
-	// every attachment.
-	absWorkDir, err := filepath.Abs(workDir)
+	// Absolutize baseDir so the returned paths are usable no matter where the
+	// process is invoked from. See issue #1459: when the root is relative
+	// (e.g. ".cc-connect" or "project/sub"), the agent's prompt referenced a
+	// relative path while the file landed elsewhere — a path mismatch that
+	// lost every attachment.
+	attachDir, err := filepath.Abs(baseDir)
 	if err != nil {
-		// Fall back to the original input. filepath.Join on a relative
-		// workDir is still better than failing the whole save, and
-		// AppendFileRefs below defensively absolutizes anyway.
-		absWorkDir = workDir
-		slog.Warn("SaveFilesToDisk: filepath.Abs failed, using raw workDir", "workDir", workDir, "error", err)
+		// Fall back to the raw input. filepath.Join on a relative baseDir is
+		// still better than failing the whole save.
+		attachDir = baseDir
+		slog.Warn("SaveFilesToBaseDir: filepath.Abs failed, using raw baseDir", "baseDir", baseDir, "error", err)
 	}
-	attachDir := filepath.Join(absWorkDir, ".cc-connect", "attachments")
 	scoped := false
 	if messageID != "" {
 		safeMid := sanitizeAttachmentFileName(messageID)
@@ -346,6 +353,10 @@ type Message struct {
 	UserID       string
 	UserName     string
 	ChatName     string // human-readable chat/group name (optional)
+	// UnionID is an optional platform-specific stable cross-app user identifier
+	// (e.g. Feishu union_id, stable across a developer's different apps for the
+	// same person). Empty when the platform doesn't provide one for this event.
+	UnionID string
 	Content      string
 	Images       []ImageAttachment   // attached images (if any)
 	Files        []FileAttachment    // attached files (if any)

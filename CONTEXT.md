@@ -70,3 +70,55 @@ Claude Code CLI 在上下文接近窗口上限时,对历史消息做的一次自
 
 ### Usage Recorder(用量入库模块)
 [[compact-orchestrator]] 所在伴生微服务的第二个模块。接收 cc-connect core 每轮回复结束时的**出站 POST**({提问人身份, model, token 四元组, [[cost]]}),写入 PostgreSQL。是否启用、pg 连接、表结构均可配置。提问人身份来自 cc-connect(平台侧 sender),CLI hook 无法提供,故此模块的数据来源必须是 core 出站钩子而非 CLI hook。
+
+## 隔离与会话记录模型
+
+> 决策依据见 [ADR-0001](docs/adr/0001-chat-scoped-isolation-model.md)。以下为该模型引入的规范术语。
+
+### 业务实体(Business Entity)
+最大隔离边界,但**在本 fork 中不作为独立运行时概念存在**——它就等于现有的 `[[project]]`(一个 project = 一个 Engine = 一个固定 [[work-dir]])。不新建 `业务实体__entity_id/` 目录,不在 [[session-key]] 或 workspace binding 里增加 entity 维度。将来若真需要"一个 project 内多租户",再引入运行时实体识别,当前不预留。
+
+- _Avoid_: 租户、tenant、entity_id(不要在代码里造这些运行时字段)
+
+### Work Dir(工作目录 / 业务实体根)
+一个 project 的 Agent 工作目录绝对路径(config 里 `[[project]]` 的 `work_dir`)。它**同时就是**该 [[业务实体]]的根,也是 Agent 进程的 cwd。work_dir 根下的 `CLAUDE.md` 就是"业务实体级 Agent 记忆",无需另建 `Agent Memory.md`。
+
+### Chat Space(聊天空间 / 群)
+消息发生的场所,以飞书 `chatID` 标识,是本模型的**顶层隔离与协作单位**。私聊、小群、大群都是 Chat Space。
+
+- **群是协作单位,不隔离到人**:同一 Chat Space 内所有成员**共享**输入文件、输出文件、群记忆。想避免串味的场景应另开小群或私聊,而非在群内按人切分。
+- 目录以 `Chat/<chatID>/` 命名。
+- _Avoid_: 会话空间、房间、room
+
+### UID(领域用户身份)
+用户在本系统内的**规范身份**,取值为飞书 **union_id**(直接来自入站消息事件 `sender.SenderId.UnionId`,无需额外 API 查询)。用于一切**对内**的身份派生:[[session-key]] 的 user 段、`Chat/<chatID>/User/<uid>/` 目录。
+
+- **对内用 uid,对外用 open_id**:凡"对飞书 API 说话"的动作(@人、resolveUserName、`allow_from` 授权)仍使用 open_id——那是与飞书交互的语言,不是领域身份。二者分工固定,不强行统一。
+- 用户**不跨群**:无 `Users/<uid>/` 顶层目录,无跨群个人长期记忆。用户身份只在某个 Chat Space 内部用于区分[[对话历史]]。
+- _Avoid_: userID、open_id(作领域身份时)、unionid(缩写统一为 uid)
+
+### Session Key(会话键)
+`core/session.go` 的 `ParseSessionKey` 定义的会话标识,默认形态 `platform:chatID:uid`。领域隔离身份(目录)与 session 身份**同源**——都由 uid 派生,不允许"目录一个 ID、session 另一个 ID"的双身份线。
+
+- 切换到 union_id 会使**历史 session 失效一次**(旧 key 基于 open_id),fork/自用阶段可接受。
+
+### Chat Memory(群记忆)
+某个 Chat Space 的群级共享场景记忆,存于 `Chat/<chatID>/Chat Memory.md`。全群共享,取代原方案里按"用户+群"分别存的设计。memory loader **只**加载当前 Chat 的 Chat Memory + work_dir 级 CLAUDE.md,不注入其他 Chat 的记忆(软隔离手段之一)。
+
+### Files Ledger(文件台账)
+`Chat/<chatID>/Files/files.jsonl`,只记录 **cc-connect 实际可观测**的两类文件:
+- `input`:用户上传文件落盘时(落盘路径从 `.cc-connect/attachments/` 迁到 `Chat/<chatID>/Inputs/`)。
+- `delivered`:Agent 调 `cc-connect send --file` 发送时。
+
+**不记录** Agent 生成但未发送的文件——该数据源在当前架构下不可得,不为它引入 work_dir 全盘扫描。
+
+### Conversations Index(会话索引)
+`Chat/<chatID>/User/<uid>/Conversations/`,cc-connect 自维护的业务级会话索引,与 Claude Code 自己的真实 JSONL **分离**:
+- `sessions.json`:记录真实 JSONL 的**绝对路径**(session 创建时由 `AgentSessionID` + `findProjectDir` 固化写入)+ session 历史。**不做软链接**(共享 work_dir / 跨机部署下软链接会断且无额外信息)。
+- `turns.jsonl`:业务级每轮索引(uid、chatID、user_text、关联 file_id、session_id、status、时间戳)。
+
+### 软隔离(Soft Isolation)
+本 fork 的**唯一**隔离手段(信任模型:仅本人及信任的同事使用,无不受信任外部用户)。由三件事构成:cwd 约定 + system prompt 软约束(默认只在当前群目录活动)+ memory loader 只加载当前 scope。
+
+- **明确不做硬隔离**:realpath 硬校验、Agent sandbox、bubblewrap 全部不实现——它们防的是不受信任 Agent 的自主越权,该威胁在本信任模型下不存在。
+- _Avoid_: 硬隔离、sandbox、bubblewrap(当前场景不适用)

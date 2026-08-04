@@ -3,6 +3,7 @@ package claudecode
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"io"
 	"os"
 	"os/exec"
@@ -462,6 +463,113 @@ func TestClaudeSessionClose_IdempotentNoPanic(t *testing.T) {
 	if err := cs.Close(); err != nil {
 		t.Fatalf("second Close: %v", err)
 	}
+}
+
+// TestAttachmentsRoot_ScopeAwarePath verifies that a scoped session lays input
+// files under "<workDir>/Chat/<chatID>/Inputs" while an unscoped session (no
+// SetScope, e.g. non-Feishu platforms) falls back to the legacy attachments
+// root. Also guards sanitizePathSegment against a traversal-y chat id.
+func TestAttachmentsRoot_ScopeAwarePath(t *testing.T) {
+	workDir := "/work"
+
+	// Unscoped: legacy root.
+	cs := &claudeSession{workDir: workDir}
+	if got, want := cs.attachmentsRoot(), filepath.Join(workDir, ".cc-connect", "attachments"); got != want {
+		t.Errorf("unscoped attachmentsRoot = %q, want %q", got, want)
+	}
+
+	// Scoped: per-chat Inputs dir.
+	cs.SetScope(core.SessionScope{ChatID: "oc_abc", UID: "on_union"})
+	if got, want := cs.attachmentsRoot(), filepath.Join(workDir, "Chat", "oc_abc", "Inputs"); got != want {
+		t.Errorf("scoped attachmentsRoot = %q, want %q", got, want)
+	}
+
+	// A traversal-y chat id must be reduced to a single safe segment.
+	cs.SetScope(core.SessionScope{ChatID: "../../etc"})
+	if got, want := cs.attachmentsRoot(), filepath.Join(workDir, "Chat", "etc", "Inputs"); got != want {
+		t.Errorf("sanitized attachmentsRoot = %q, want %q", got, want)
+	}
+}
+
+// TestWriteConversationsIndex_ScopedUpsert verifies that a scoped session
+// writes Conversations/sessions.json under Chat/<chatID>/User/<uid>/, upserts
+// new session UUIDs, updates current_session_id, and dedups repeated writes.
+func TestWriteConversationsIndex_ScopedUpsert(t *testing.T) {
+	wd := t.TempDir()
+	cs := &claudeSession{workDir: wd}
+	cs.SetScope(core.SessionScope{ChatID: "oc_x", UID: "on_u"})
+
+	path := filepath.Join(wd, "Chat", "oc_x", "User", "on_u", "Conversations", "sessions.json")
+
+	// First UUID.
+	cs.sessionID.Store("uuid-1")
+	cs.writeConversationsIndex()
+	idx := readConvIndex(t, path)
+	if idx.CurrentSessionID != "uuid-1" {
+		t.Errorf("current_session_id = %q, want uuid-1", idx.CurrentSessionID)
+	}
+	if len(idx.Sessions) != 1 {
+		t.Fatalf("sessions = %d, want 1", len(idx.Sessions))
+	}
+	if idx.Sessions[0].Engine != "claudecode" {
+		t.Errorf("engine = %q, want claudecode", idx.Sessions[0].Engine)
+	}
+
+	// Second UUID appends a new entry and moves current.
+	cs.sessionID.Store("uuid-2")
+	cs.writeConversationsIndex()
+	idx = readConvIndex(t, path)
+	if idx.CurrentSessionID != "uuid-2" || len(idx.Sessions) != 2 {
+		t.Errorf("after 2nd: current=%q sessions=%d, want uuid-2 / 2", idx.CurrentSessionID, len(idx.Sessions))
+	}
+
+	// Dedup: same UUID again does not add a third entry.
+	cs.writeConversationsIndex()
+	idx = readConvIndex(t, path)
+	if len(idx.Sessions) != 2 {
+		t.Errorf("after dedup: sessions=%d, want 2", len(idx.Sessions))
+	}
+}
+
+// TestWriteConversationsIndex_NoScopeSkips verifies an unscoped session writes
+// nothing and does not panic, and that channel-shared (empty uid) sessions land
+// at the chat level (no User/ segment).
+func TestWriteConversationsIndex_NoScopeSkips(t *testing.T) {
+	wd := t.TempDir()
+
+	// No scope → no dir, no file, no panic.
+	cs := &claudeSession{workDir: wd}
+	if got := cs.conversationsDir(); got != "" {
+		t.Errorf("unscoped conversationsDir = %q, want empty", got)
+	}
+	cs.sessionID.Store("uuid-1")
+	cs.writeConversationsIndex() // must not panic or create anything
+	if _, err := os.Stat(filepath.Join(wd, "Chat")); !os.IsNotExist(err) {
+		t.Errorf("unscoped session created Chat/ dir")
+	}
+
+	// Channel-shared (uid empty) → chat-level, no User/ segment.
+	cs2 := &claudeSession{workDir: wd}
+	cs2.SetScope(core.SessionScope{ChatID: "oc_y"})
+	cs2.sessionID.Store("uuid-9")
+	cs2.writeConversationsIndex()
+	sharedPath := filepath.Join(wd, "Chat", "oc_y", "Conversations", "sessions.json")
+	if _, err := os.Stat(sharedPath); err != nil {
+		t.Errorf("channel-shared index not at chat level: %v", err)
+	}
+}
+
+func readConvIndex(t *testing.T, path string) conversationsIndex {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read sessions.json: %v", err)
+	}
+	var idx conversationsIndex
+	if err := json.Unmarshal(data, &idx); err != nil {
+		t.Fatalf("unmarshal sessions.json: %v", err)
+	}
+	return idx
 }
 
 func TestShellJoinArgs(t *testing.T) {

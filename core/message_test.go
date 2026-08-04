@@ -56,6 +56,37 @@ func TestUnauthorizedAccessMessage(t *testing.T) {
 // "../../escape.txt" wrote outside the intended attachments directory into
 // the agent's workDir / above. The fix sanitizes FileName to a basename;
 // this test asserts every file lands inside attachDir, with no escapees.
+// TestSaveFilesToBaseDir_ScopedBaseAndMessageSubdir verifies that
+// SaveFilesToBaseDir honors an arbitrary (scoped) base directory and still
+// isolates a message's attachments under a per-message subdir, and that
+// SaveFilesToDisk keeps delegating to the legacy attachments root.
+func TestSaveFilesToBaseDir_ScopedBaseAndMessageSubdir(t *testing.T) {
+	workDir := t.TempDir()
+
+	// A scoped base like "<workDir>/Chat/<chatID>/Inputs".
+	base := filepath.Join(workDir, "Chat", "oc_abc", "Inputs")
+	files := []FileAttachment{{FileName: "report.pdf", Data: []byte("payload")}}
+
+	paths := SaveFilesToBaseDir(base, "om_msg1", files)
+	if len(paths) != 1 {
+		t.Fatalf("got %d paths, want 1", len(paths))
+	}
+	wantDir := filepath.Join(base, "om_msg1")
+	if !strings.HasPrefix(paths[0], wantDir+string(filepath.Separator)) {
+		t.Errorf("file not under per-message scoped dir: %q (want prefix %q)", paths[0], wantDir)
+	}
+	if _, err := os.Stat(paths[0]); err != nil {
+		t.Errorf("scoped file not written: %v", err)
+	}
+
+	// SaveFilesToDisk still writes under the legacy attachments root.
+	legacy := SaveFilesToDisk(workDir, "om_msg2", files)
+	legacyRoot := filepath.Join(workDir, ".cc-connect", "attachments")
+	if len(legacy) != 1 || !strings.HasPrefix(legacy[0], legacyRoot+string(filepath.Separator)) {
+		t.Errorf("SaveFilesToDisk = %v, want a path under %q", legacy, legacyRoot)
+	}
+}
+
 func TestSaveFilesToDisk_RejectsPathTraversal(t *testing.T) {
 	workDir := t.TempDir()
 	attachDir := filepath.Join(workDir, ".cc-connect", "attachments")

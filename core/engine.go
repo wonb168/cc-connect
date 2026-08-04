@@ -1029,10 +1029,11 @@ func (e *Engine) appendToolStep(steps []ToolStep, name, summary string) []ToolSt
 		}
 	}
 	return append(steps, ToolStep{
-		Kind:    ToolStepKindTool,
-		Name:    name,
-		Summary: summary,
-		Count:   1,
+		Kind:      ToolStepKindTool,
+		Name:      name,
+		Summary:   summary,
+		Count:     1,
+		TitleOnly: e.toolTitleTransient,
 	})
 }
 
@@ -3051,7 +3052,7 @@ func (e *Engine) handleMessage(p Platform, msg *Message) {
 	}
 
 	session := sessions.GetOrCreateActive(msg.SessionKey)
-	sessions.UpdateUserMeta(msg.SessionKey, msg.UserName, msg.ChatName)
+	sessions.UpdateUserMeta(msg.SessionKey, msg.UserName, msg.ChatName, msg.UnionID)
 	// Ensure an interactiveState entry exists before taking the session lock.
 	// Without this, concurrent messages can observe the session as busy during
 	// startup but still find no state to queue into.
@@ -4192,6 +4193,9 @@ func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform, 
 		}
 	}
 
+	// Hand per-chat/per-user directory scoping to sessions that opt in.
+	applySessionScope(agentSession, sessionKey)
+
 	if newID := agentSession.CurrentSessionID(); newID != "" {
 		// Track the latest session ID Claude reports. Each --resume forks a new
 		// session_id, so the stored ID must follow the live process or a later
@@ -5254,7 +5258,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				}
 				if result != "" || event.ToolStatus != "" || event.ToolExitCode != nil || event.ToolSuccess != nil {
 					if hasRichCard {
-						toolSteps = mergeRichToolResult(toolSteps, event, result, e.display.ToolMaxLen)
+						toolSteps = mergeRichToolResult(toolSteps, event, result, e.display.ToolMaxLen, e.toolTitleTransient)
 						if cardMessageID == nil {
 							card := buildResolvedRichCard(CardStatusWorking, "", toolSteps, partialText, true, e.composeRichStatusFooter(true, turnStart, e.agent, state.agentSession, state.workspaceDir))
 							if starter, ok := p.(PreviewStarter); ok {
@@ -5704,7 +5708,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			// Best-effort, non-blocking usage/cost record to the external
 			// recorder (no-op when unconfigured). Uses sessionKey for stable
 			// platform+sender identity (Q7甲).
-			e.recordUsage(sessionKey, replyFooterModel(state.agentSession, e.agent), event, time.Now())
+			e.recordUsage(sessionKey, replyFooterModel(state.agentSession, replyAgent), sessions, event, replyFooterSessionContextUsage(state.agentSession), turnDuration, time.Now())
 
 			e.noteUserTurnCompleted(state)
 
@@ -5792,7 +5796,11 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 					parts = splitter.SplitMarkdownByTables(fullResponse, 5)
 				}
 				richStatusFooter := e.composeRichStatusFooter(false, turnStart, e.agent, state.agentSession, state.workspaceDir)
-				if legacyStatusFooter != "" {
+				// Only fall back to the legacy statusFooter when no template is
+				// configured — composeRichStatusFooter already renders the template
+				// (which includes elapsed), so layering legacy on top would double-
+				// print and revert to the non-template layout.
+				if legacyStatusFooter != "" && e.replyFooterTemplate == "" {
 					richStatusFooter = formatElapsed(time.Since(turnStart), false, e.i18n.currentLang()) + "\n" + legacyStatusFooter
 				}
 				finalBody := resolveRichCardMarkdown(parts[0], true)
@@ -6178,7 +6186,7 @@ channelClosed:
 	}
 }
 
-func mergeRichToolResult(steps []ToolStep, event Event, result string, maxLen int) []ToolStep {
+func mergeRichToolResult(steps []ToolStep, event Event, result string, maxLen int, titleOnly bool) []ToolStep {
 	toolName := strings.TrimSpace(event.ToolName)
 	if toolName == "" {
 		toolName = "Tool"
@@ -6200,11 +6208,17 @@ func mergeRichToolResult(steps []ToolStep, event Event, result string, maxLen in
 			summary = truncateIf(summary, maxLen)
 		}
 		steps = append(steps, ToolStep{
-			Kind:    ToolStepKindTool,
-			Name:    toolName,
-			Summary: summary,
+			Kind:      ToolStepKindTool,
+			Name:      toolName,
+			Summary:   summary,
+			TitleOnly: titleOnly,
 		})
 		idx = len(steps) - 1
+	}
+	// Ensure previously-created out-of-order rows also hide their body when
+	// title-only mode is on, so tool input/result never leaks to the card.
+	if titleOnly && !steps[idx].TitleOnly {
+		steps[idx].TitleOnly = titleOnly
 	}
 
 	if strings.TrimSpace(steps[idx].Name) == "" {
@@ -7521,9 +7535,21 @@ func replyFooterSessionCostUSD(session AgentSession) float64 {
 	return reporter.GetLastCostUSD()
 }
 
+// formatMoney renders a monetary/point value to at most 4 decimal places with
+// trailing zeros trimmed (e.g. 0.35406250000000006 → "0.3541", 5.0 → "5").
+// Rounding to 4 dp avoids leaking float64 representation noise into the footer.
+func formatMoney(v float64) string {
+	s := strconv.FormatFloat(v, 'f', 4, 64)
+	if strings.Contains(s, ".") {
+		s = strings.TrimRight(s, "0")
+		s = strings.TrimRight(s, ".")
+	}
+	return s
+}
+
 // formatCostSegment renders the footer cost segment "<point>点(<$cost>)" from a
 // USD cost and the display point ratio. Returns "" when cost is unknown (<=0).
-// The point value drops trailing zeros; the USD value keeps up to 4 decimals.
+// Values are rounded to 4 decimals with trailing zeros trimmed.
 func formatCostSegment(costUSD, pointRatio float64, i18n *I18n) string {
 	if costUSD <= 0 {
 		return ""
@@ -7531,9 +7557,8 @@ func formatCostSegment(costUSD, pointRatio float64, i18n *I18n) string {
 	if pointRatio <= 0 {
 		pointRatio = 1
 	}
-	point := costUSD * pointRatio
-	pointStr := strconv.FormatFloat(point, 'f', -1, 64)
-	costStr := strconv.FormatFloat(costUSD, 'f', -1, 64)
+	pointStr := formatMoney(costUSD * pointRatio)
+	costStr := formatMoney(costUSD)
 	if i18n != nil {
 		return i18n.Tf(MsgReplyFooterCost, pointStr, costStr)
 	}
@@ -7570,8 +7595,8 @@ func (e *Engine) footerTemplateVars(elapsed, model, effort string, costUSD float
 		if ratio <= 0 {
 			ratio = 1
 		}
-		vars["cost_usd"] = strconv.FormatFloat(costUSD, 'f', -1, 64)
-		vars["point"] = strconv.FormatFloat(costUSD*ratio, 'f', -1, 64)
+		vars["cost_usd"] = formatMoney(costUSD)
+		vars["point"] = formatMoney(costUSD * ratio)
 	}
 	if usage != nil && usage.ContextWindow > 0 {
 		used := usage.UsedTokens
@@ -15931,6 +15956,8 @@ func (e *Engine) HandleRelay(ctx context.Context, fromProject, sourceSessionKey,
 	}
 
 	saveRelaySessionID(agentSession.CurrentSessionID(), false)
+
+	applySessionScope(agentSession, relaySessionKey)
 
 	if err := agentSession.Send(message, "", nil, nil); err != nil {
 		agentSession.Close()

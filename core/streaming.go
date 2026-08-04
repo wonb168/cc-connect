@@ -75,6 +75,11 @@ type ToolStep struct {
 	// represents (>=1). Renderers show "Name ×Count" when Count > 1. Zero is
 	// treated as 1 for backward compatibility.
 	Count int
+	// TitleOnly, when true, asks renderers to show only this step's title
+	// (e.g. "Bash ×3") and omit the body (command/args/output). Set by the
+	// engine for tool rows when transient tool titles are enabled. Does not
+	// apply to thinking rows.
+	TitleOnly bool
 }
 
 // RichCardSupporter is an optional interface for platforms that can build

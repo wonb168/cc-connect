@@ -43,6 +43,17 @@ type claudeSession struct {
 	done            chan struct{}
 	alive           atomic.Bool
 
+	// scopeMu guards scope. The engine sets it (SetScope) right after
+	// StartSession, on a different goroutine than Send which reads it.
+	scopeMu sync.Mutex
+	scope   core.SessionScope
+
+	// convMu guards writes to the per-chat Conversations/sessions.json index.
+	// lastConvSessionID dedups: the index is only rewritten when the CLI
+	// reports a session UUID different from the last one persisted.
+	convMu            sync.Mutex
+	lastConvSessionID string
+
 	// activeModel stores the model id reported by the CLI's init event (e.g.
 	// "claude-opus-4-7[1m]"). It may be empty if the init event hasn't
 	// carried a model field yet; callers should fall back to the Agent's
@@ -80,6 +91,169 @@ type claudeSession struct {
 // when the session was started under degraded conditions that the user should
 // know about (e.g. bypassPermissions downgraded to auto under root).
 func (cs *claudeSession) StartupWarning() string { return cs.startupWarning }
+
+// SetScope implements core.ScopedSession. The engine calls it right after
+// StartSession with the chat/user coordinates derived from the session key,
+// so input attachments can be laid out under a per-chat directory.
+func (cs *claudeSession) SetScope(scope core.SessionScope) {
+	cs.scopeMu.Lock()
+	cs.scope = scope
+	cs.scopeMu.Unlock()
+}
+
+// attachmentsRoot returns the base directory for saving user-supplied input
+// files. When a chat scope is present it isolates inputs under
+// "<workDir>/Chat/<chatID>/Inputs" (group is the top-level collaboration unit;
+// see CONTEXT.md). Without a scope (other platforms, or before SetScope) it
+// falls back to the legacy "<workDir>/.cc-connect/attachments" root.
+func (cs *claudeSession) attachmentsRoot() string {
+	cs.scopeMu.Lock()
+	chatID := cs.scope.ChatID
+	cs.scopeMu.Unlock()
+	if chatID != "" {
+		return filepath.Join(cs.workDir, "Chat", sanitizePathSegment(chatID), "Inputs")
+	}
+	return filepath.Join(cs.workDir, ".cc-connect", "attachments")
+}
+
+// sanitizePathSegment reduces an untrusted identifier (e.g. a platform chat
+// ID) to a single safe path segment: path separators and traversal are
+// stripped, and any leftover empty/dotted result falls back to a stable
+// placeholder so callers never join "" or "..".
+func sanitizePathSegment(s string) string {
+	s = filepath.Base(strings.TrimSpace(s))
+	if s == "" || s == "." || s == ".." || s == string(filepath.Separator) {
+		return "_"
+	}
+	return s
+}
+
+// conversationsIndex is the on-disk shape of Conversations/sessions.json: a
+// stable, human-readable pointer from a chat/user to the underlying Claude
+// Code JSONL transcript(s). It records real paths rather than symlinks
+// (ADR-0001, option B) so it survives across machines and never dangles.
+type conversationsIndex struct {
+	CurrentSessionID string         `json:"current_session_id"`
+	Sessions         []sessionEntry `json:"sessions"`
+}
+
+type sessionEntry struct {
+	SessionID     string `json:"session_id"`
+	Engine        string `json:"engine"`
+	RealJSONLPath string `json:"real_jsonl_path"`
+	StartedAt     string `json:"started_at"`
+	UpdatedAt     string `json:"updated_at"`
+}
+
+// conversationsDir returns the directory that holds this session's
+// Conversations/sessions.json, or "" when there is no chat scope (e.g.
+// non-Feishu platforms, or before SetScope) in which case no index is written.
+// Layout mirrors the isolation model (CONTEXT.md): per-user under a chat, or
+// chat-level when the session is channel-shared (uid empty).
+func (cs *claudeSession) conversationsDir() string {
+	cs.scopeMu.Lock()
+	chatID := cs.scope.ChatID
+	uid := cs.scope.UID
+	cs.scopeMu.Unlock()
+	if chatID == "" {
+		return ""
+	}
+	base := filepath.Join(cs.workDir, "Chat", sanitizePathSegment(chatID))
+	if uid != "" {
+		// Thread-mode uid is "root:rootID"; ":" is legal on unix but ugly, so
+		// normalize before it becomes a path segment.
+		uid = strings.ReplaceAll(uid, ":", "_")
+		base = filepath.Join(base, "User", sanitizePathSegment(uid))
+	}
+	return filepath.Join(base, "Conversations")
+}
+
+// writeConversationsIndex upserts the current Claude session UUID (and its real
+// JSONL transcript path) into Conversations/sessions.json. It is called right
+// after the CLI reports a session_id. Best-effort: failures are logged and
+// never disrupt the turn. Deduped via lastConvSessionID so repeated result
+// events for the same UUID don't rewrite the file.
+func (cs *claudeSession) writeConversationsIndex() {
+	dir := cs.conversationsDir()
+	if dir == "" {
+		return
+	}
+	sid := cs.CurrentSessionID()
+	if sid == "" {
+		return
+	}
+	cs.convMu.Lock()
+	defer cs.convMu.Unlock()
+	if sid == cs.lastConvSessionID {
+		return
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		slog.Warn("claudeSession: mkdir Conversations failed", "error", err, "dir", dir)
+		return
+	}
+	path := filepath.Join(dir, "sessions.json")
+
+	var idx conversationsIndex
+	if data, err := os.ReadFile(path); err == nil {
+		if err := json.Unmarshal(data, &idx); err != nil {
+			slog.Warn("claudeSession: sessions.json parse failed, rewriting", "error", err, "path", path)
+			idx = conversationsIndex{}
+		}
+	}
+
+	now := time.Now().Format(time.RFC3339)
+	realPath := cs.transcriptPath()
+	found := false
+	for i := range idx.Sessions {
+		if idx.Sessions[i].SessionID == sid {
+			idx.Sessions[i].UpdatedAt = now
+			if realPath != "" {
+				idx.Sessions[i].RealJSONLPath = realPath
+			}
+			found = true
+			break
+		}
+	}
+	if !found {
+		idx.Sessions = append(idx.Sessions, sessionEntry{
+			SessionID:     sid,
+			Engine:        "claudecode",
+			RealJSONLPath: realPath,
+			StartedAt:     now,
+			UpdatedAt:     now,
+		})
+	}
+	idx.CurrentSessionID = sid
+
+	data, err := json.MarshalIndent(&idx, "", "  ")
+	if err != nil {
+		slog.Warn("claudeSession: sessions.json marshal failed", "error", err)
+		return
+	}
+	tmp, err := os.CreateTemp(dir, "sessions-*.json.tmp")
+	if err != nil {
+		slog.Warn("claudeSession: sessions.json tempfile failed", "error", err, "dir", dir)
+		return
+	}
+	tmpName := tmp.Name()
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+		slog.Warn("claudeSession: sessions.json write failed", "error", err)
+		return
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpName)
+		slog.Warn("claudeSession: sessions.json close failed", "error", err)
+		return
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		_ = os.Remove(tmpName)
+		slog.Warn("claudeSession: sessions.json rename failed", "error", err, "path", path)
+		return
+	}
+	cs.lastConvSessionID = sid
+}
 
 // sharedSystemPromptRelPath is the location under ccDataDir where the
 // shared cc-connect system prompt file lives. Reused across every spawn
@@ -620,6 +794,7 @@ func (cs *claudeSession) handleSystem(raw map[string]any) {
 	}
 	if sid, ok := raw["session_id"].(string); ok && sid != "" {
 		cs.sessionID.Store(sid)
+		cs.writeConversationsIndex()
 		evt := core.Event{Type: core.EventText, SessionID: sid}
 		select {
 		case cs.events <- evt:
@@ -799,6 +974,7 @@ func (cs *claudeSession) handleResult(raw map[string]any) {
 	}
 	if sid, ok := raw["session_id"].(string); ok && sid != "" {
 		cs.sessionID.Store(sid)
+		cs.writeConversationsIndex()
 	}
 
 	// Compaction events arrive as `type:"result"` with `subtype:"compact"`
@@ -970,7 +1146,7 @@ func (cs *claudeSession) Send(prompt string, messageID string, images []core.Ima
 		})
 	}
 
-	attachDir := filepath.Join(cs.workDir, ".cc-connect", "attachments")
+	attachDir := cs.attachmentsRoot()
 	if err := os.MkdirAll(attachDir, 0o755); err != nil {
 		slog.Warn("claudeSession: mkdir attachments failed", "error", err, "path", attachDir)
 	}
@@ -1005,7 +1181,7 @@ func (cs *claudeSession) Send(prompt string, messageID string, images []core.Ima
 	}
 
 	// Save files to disk so Claude Code can read them
-	filePaths := core.SaveFilesToDisk(cs.workDir, messageID, files)
+	filePaths := core.SaveFilesToBaseDir(attachDir, messageID, files)
 
 	// Build text part: user prompt + file path references
 	textPart := prompt

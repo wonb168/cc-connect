@@ -405,7 +405,7 @@ func TestSessionManager_UserMeta(t *testing.T) {
 	sm.GetOrCreateActive("feishu:oc_abc:ou_xyz")
 
 	// Set UserName
-	sm.UpdateUserMeta("feishu:oc_abc:ou_xyz", "Zhang San", "")
+	sm.UpdateUserMeta("feishu:oc_abc:ou_xyz", "Zhang San", "", "")
 	meta := sm.GetUserMeta("feishu:oc_abc:ou_xyz")
 	if meta == nil || meta.UserName != "Zhang San" {
 		t.Errorf("expected UserName='Zhang San', got %+v", meta)
@@ -415,16 +415,23 @@ func TestSessionManager_UserMeta(t *testing.T) {
 	}
 
 	// Merge: add ChatName without losing UserName
-	sm.UpdateUserMeta("feishu:oc_abc:ou_xyz", "", "Test Group")
+	sm.UpdateUserMeta("feishu:oc_abc:ou_xyz", "", "Test Group", "")
 	meta = sm.GetUserMeta("feishu:oc_abc:ou_xyz")
 	if meta.UserName != "Zhang San" || meta.ChatName != "Test Group" {
 		t.Errorf("expected merge, got %+v", meta)
 	}
 
-	// No-op for empty values
-	sm.UpdateUserMeta("feishu:oc_abc:ou_xyz", "", "")
+	// Merge: add UnionID without losing UserName/ChatName
+	sm.UpdateUserMeta("feishu:oc_abc:ou_xyz", "", "", "union_xyz")
 	meta = sm.GetUserMeta("feishu:oc_abc:ou_xyz")
-	if meta.UserName != "Zhang San" || meta.ChatName != "Test Group" {
+	if meta.UserName != "Zhang San" || meta.ChatName != "Test Group" || meta.UnionID != "union_xyz" {
+		t.Errorf("expected merge with UnionID, got %+v", meta)
+	}
+
+	// No-op for empty values
+	sm.UpdateUserMeta("feishu:oc_abc:ou_xyz", "", "", "")
+	meta = sm.GetUserMeta("feishu:oc_abc:ou_xyz")
+	if meta.UserName != "Zhang San" || meta.ChatName != "Test Group" || meta.UnionID != "union_xyz" {
 		t.Errorf("expected no change, got %+v", meta)
 	}
 
@@ -440,7 +447,7 @@ func TestSessionManager_UserMetaPersistence(t *testing.T) {
 
 	sm1 := NewSessionManager(path)
 	sm1.NewSession("feishu:oc_abc:ou_xyz", "test")
-	sm1.UpdateUserMeta("feishu:oc_abc:ou_xyz", "Zhang San", "Group Name")
+	sm1.UpdateUserMeta("feishu:oc_abc:ou_xyz", "Zhang San", "Group Name", "")
 	sm1.Save()
 
 	sm2 := NewSessionManager(path)
@@ -622,6 +629,31 @@ func TestParseSessionKey(t *testing.T) {
 			}
 			if userOrThread != tt.wantUser {
 				t.Errorf("userOrThread = %q, want %q", userOrThread, tt.wantUser)
+			}
+		})
+	}
+}
+
+func TestScopeFromSessionKey(t *testing.T) {
+	tests := []struct {
+		key        string
+		wantChatID string
+		wantUID    string
+	}{
+		{"feishu:oc_abc123:on_union789", "oc_abc123", "on_union789"},
+		{"feishu:oc_abc123", "oc_abc123", ""},                          // channel-shared: chat-level only
+		{"telegram:-100123:root:msg456", "-100123", "root:msg456"},     // thread mode
+		{"invalid", "", ""},
+		{"", "", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.key, func(t *testing.T) {
+			got := ScopeFromSessionKey(tt.key)
+			if got.ChatID != tt.wantChatID {
+				t.Errorf("ChatID = %q, want %q", got.ChatID, tt.wantChatID)
+			}
+			if got.UID != tt.wantUID {
+				t.Errorf("UID = %q, want %q", got.UID, tt.wantUID)
 			}
 		})
 	}

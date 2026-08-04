@@ -153,3 +153,6 @@ credentials/
 
 .codex
 cc-connect-new
+
+# 测试运行产生的临时 workspace 状态文件
+core/test_ws_*.json

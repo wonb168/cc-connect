@@ -79,6 +79,7 @@ func TestDispatchMessageDropsRecalledMessageBeforeHandler(t *testing.T) {
 		"feishu:ou_user:ou_user",
 		"",
 		"",
+		"",
 		replyContext{messageID: "om_drop", sessionKey: "feishu:ou_user:ou_user"},
 		"",
 		0,
@@ -185,6 +186,7 @@ func TestDispatchMessageIncludesQuotedImage(t *testing.T) {
 				"feishu:oc_chat:ou_user",
 				"",
 				"",
+				"",
 				replyContext{messageID: "om_child", sessionKey: "feishu:oc_chat:ou_user"},
 				parentMessageID,
 				0,
@@ -285,6 +287,7 @@ func TestDispatchMessageKeepsMentionOnlyQuotedText(t *testing.T) {
 		"om_child",
 		"feishu:oc_chat:ou_user",
 		"ou_user",
+		"",
 		"oc_chat",
 		replyContext{messageID: "om_child", sessionKey: "feishu:oc_chat:ou_user"},
 		parentMessageID,
@@ -1607,6 +1610,7 @@ func TestDispatchMessageCoalescesImageBatch(t *testing.T) {
 					msgID,
 					sessionKey,
 					userID,
+					"",
 					chatID,
 					replyContext{messageID: msgID, chatID: chatID, sessionKey: sessionKey},
 					"", // no parentID so we exercise the batch path
@@ -1709,6 +1713,7 @@ func TestDispatchMessageSingleImageRegression(t *testing.T) {
 		"om_single",
 		"feishu:oc_single:ou_user",
 		"ou_user",
+		"",
 		"oc_single",
 		replyContext{messageID: "om_single", chatID: "oc_single", sessionKey: "feishu:oc_single:ou_user"},
 		"", 0,
@@ -1803,6 +1808,7 @@ func TestDispatchMessageQuotedImageNotBatched(t *testing.T) {
 		"om_quoted_child",
 		"feishu:oc_chat:ou_user",
 		"ou_user",
+		"",
 		"oc_chat",
 		replyContext{messageID: "om_quoted_child", chatID: "oc_chat", sessionKey: "feishu:oc_chat:ou_user"},
 		parentMessageID, 0,
@@ -1924,4 +1930,124 @@ func TestFlushImageBatchesEmptySafe(t *testing.T) {
 	}
 	// Should not panic, should not block.
 	p.flushImageBatches()
+}
+
+// TestOnMessagePropagatesUnionIDWithoutAffectingUserID verifies that with
+// session_use_union_id disabled (opt-out), the inbound event's union_id is
+// still propagated into core.Message.UnionID while core.Message.UserID and the
+// SessionKey continue to use open_id. The default (flag on) path is covered by
+// TestMakeSessionKeyUnionID.
+func TestOnMessagePropagatesUnionIDWithoutAffectingUserID(t *testing.T) {
+	const openID = "ou_test_user"
+	const unionID = "on_test_union"
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/open-apis/auth/v3/tenant_access_token/internal":
+			writeJSON(t, w, map[string]any{
+				"code":                0,
+				"msg":                 "success",
+				"expire":              7200,
+				"tenant_access_token": "tenant-token",
+			})
+		default:
+			// resolveUserName best-effort lookup; any response is fine, code!=0 makes it fall back to openID.
+			writeJSON(t, w, map[string]any{"code": 99999, "msg": "not found"})
+		}
+	}))
+	defer srv.Close()
+
+	got := make(chan *core.Message, 1)
+	p := &Platform{
+		platformName:      "feishu",
+		domain:            srv.URL,
+		appID:             "cli_union_test",
+		appSecret:         "secret-union-test",
+		sessionUseUnionID: false, // opt-out: keep open_id as the session identity
+		dedup:             &core.MessageDedup{},
+		client: lark.NewClient("cli_union_test", "secret-union-test",
+			lark.WithOpenBaseUrl(srv.URL),
+			lark.WithHttpClient(srv.Client()),
+		),
+		handler: func(_ core.Platform, msg *core.Message) {
+			got <- msg
+		},
+	}
+
+	msgID := "om_union_test"
+	chatID := "oc_test"
+	msgType := "text"
+	chatType := "p2p"
+	senderType := "user"
+	content := `{"text":"hello"}`
+	createTime := strconv.FormatInt(time.Now().UnixMilli(), 10)
+
+	event := &larkim.P2MessageReceiveV1{
+		Event: &larkim.P2MessageReceiveV1Data{
+			Sender: &larkim.EventSender{
+				SenderId:   &larkim.UserId{OpenId: stringPtr(openID), UnionId: stringPtr(unionID)},
+				SenderType: &senderType,
+			},
+			Message: &larkim.EventMessage{
+				MessageId:   &msgID,
+				ChatId:      &chatID,
+				ChatType:    &chatType,
+				MessageType: &msgType,
+				Content:     &content,
+				CreateTime:  &createTime,
+			},
+		},
+	}
+
+	if err := p.onMessage(context.Background(), event); err != nil {
+		t.Fatalf("onMessage() error = %v", err)
+	}
+
+	select {
+	case msg := <-got:
+		if msg.UserID != openID {
+			t.Errorf("UserID = %q, want open_id %q unchanged", msg.UserID, openID)
+		}
+		if msg.UnionID != unionID {
+			t.Errorf("UnionID = %q, want %q", msg.UnionID, unionID)
+		}
+		if !strings.Contains(msg.SessionKey, openID) {
+			t.Errorf("SessionKey = %q, want it to still be keyed by open_id", msg.SessionKey)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for dispatched message")
+	}
+}
+
+// TestMakeSessionKeyUnionID covers the uid selection in makeSessionKey: with
+// session_use_union_id on, the default per-user branch keys on union_id when
+// present and falls back to open_id when union_id is empty; with the flag off
+// it always keys on open_id. The share/thread branches never carry a user
+// segment and are unaffected.
+func TestMakeSessionKeyUnionID(t *testing.T) {
+	const openID = "ou_open"
+	const unionID = "on_union"
+	const chatID = "oc_chat"
+
+	cases := []struct {
+		name          string
+		useUnionID    bool
+		union         string
+		wantUserSeg   string
+	}{
+		{"flag on, union present", true, unionID, unionID},
+		{"flag on, union empty -> open_id", true, "", openID},
+		{"flag off -> open_id", false, unionID, openID},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p := &Platform{platformName: "feishu", sessionUseUnionID: tc.useUnionID}
+			got := p.makeSessionKey(nil, chatID, openID, tc.union)
+			want := "feishu:" + chatID + ":" + tc.wantUserSeg
+			if got != want {
+				t.Errorf("makeSessionKey = %q, want %q", got, want)
+			}
+		})
+	}
 }

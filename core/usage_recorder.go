@@ -16,18 +16,22 @@ import (
 const usageRecorderTimeout = 1500 * time.Millisecond
 
 // UsageRecord is the payload POSTed to the external usage-recorder microservice
-// after every completed turn. It carries only stable identifiers plus the
-// turn's token counts and authoritative USD cost — no message content (Q7甲).
+// after every completed turn. Fields map to the companion's destination table
+// (e.g. a shared "turns" table): no message content is carried (Q7甲).
 type UsageRecord struct {
 	Platform                 string  `json:"platform"`
 	SenderID                 string  `json:"sender_id"`
 	SessionKey               string  `json:"session_key"`
+	UserName                 string  `json:"user_name,omitempty"`
+	Agent                    string  `json:"agent"`
 	Model                    string  `json:"model"`
 	InputTokens              int     `json:"input_tokens"`
 	OutputTokens             int     `json:"output_tokens"`
 	CacheCreationInputTokens int     `json:"cache_creation_input_tokens"`
 	CacheReadInputTokens     int     `json:"cache_read_input_tokens"`
 	CostUSD                  float64 `json:"cost_usd"`
+	TurnDurationMs           int     `json:"turn_duration_ms"`
+	ContextPct               int     `json:"context_pct"`
 	TimestampMs              int64   `json:"timestamp_ms"`
 }
 
@@ -41,22 +45,51 @@ func (e *Engine) SetUsageRecorderEndpoint(endpoint string) {
 // to the configured recorder endpoint. Safe to call unconditionally: it returns
 // immediately when recording is disabled. Never blocks the caller (spawns a
 // goroutine with its own short timeout).
-func (e *Engine) recordUsage(sessionKey, model string, ev Event, ts time.Time) {
+func (e *Engine) recordUsage(sessionKey, model string, sessions *SessionManager, ev Event, usage *ContextUsage, turnDuration time.Duration, ts time.Time) {
 	endpoint := e.usageRecorderEndpoint
 	if endpoint == "" {
 		return
 	}
 	platform, _, senderID := ParseSessionKey(sessionKey)
+	var ctxPct int
+	if usage != nil && usage.ContextWindow > 0 {
+		used := usage.UsedTokens
+		if used <= 0 && usage.TotalTokens > 0 {
+			used = usage.TotalTokens
+		}
+		if used > 0 {
+			ctxPct = used * 100 / usage.ContextWindow
+			if ctxPct > 100 {
+				ctxPct = 100
+			}
+		}
+	}
+	if sessions == nil {
+		sessions = e.sessions
+	}
+	var userName string
+	if sessions != nil {
+		if meta := sessions.GetUserMeta(sessionKey); meta != nil {
+			userName = meta.UserName
+			if meta.UnionID != "" {
+				senderID = meta.UnionID
+			}
+		}
+	}
 	rec := UsageRecord{
 		Platform:                 platform,
 		SenderID:                 senderID,
 		SessionKey:               sessionKey,
+		UserName:                 userName,
+		Agent:                    e.name,
 		Model:                    model,
 		InputTokens:              ev.InputTokens,
 		OutputTokens:             ev.OutputTokens,
 		CacheCreationInputTokens: ev.CacheCreationInputTokens,
 		CacheReadInputTokens:     ev.CacheReadInputTokens,
 		CostUSD:                  ev.CostUSD,
+		TurnDurationMs:           int(turnDuration / time.Millisecond),
+		ContextPct:               ctxPct,
 		TimestampMs:              ts.UnixMilli(),
 	}
 	go postUsageRecord(endpoint, rec)

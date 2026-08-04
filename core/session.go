@@ -256,6 +256,9 @@ func (s *Session) GetHistory(n int) []HistoryEntry {
 type UserMeta struct {
 	UserName string `json:"user_name,omitempty"`
 	ChatName string `json:"chat_name,omitempty"`
+	// UnionID is the platform-specific stable cross-app user identifier (e.g.
+	// Feishu union_id), when the platform provides one.
+	UnionID string `json:"union_id,omitempty"`
 }
 
 // snapshotVersion tracks the schema version so we can detect data saved by
@@ -463,8 +466,8 @@ func (sm *SessionManager) GetSessionName(agentSessionID string) string {
 
 // UpdateUserMeta updates the human-readable metadata for a session key.
 // Only non-empty fields are applied (merge behavior).
-func (sm *SessionManager) UpdateUserMeta(sessionKey, userName, chatName string) {
-	if userName == "" && chatName == "" {
+func (sm *SessionManager) UpdateUserMeta(sessionKey, userName, chatName, unionID string) {
+	if userName == "" && chatName == "" && unionID == "" {
 		return
 	}
 	sm.mu.Lock()
@@ -479,6 +482,9 @@ func (sm *SessionManager) UpdateUserMeta(sessionKey, userName, chatName string) 
 	}
 	if chatName != "" {
 		meta.ChatName = chatName
+	}
+	if unionID != "" {
+		meta.UnionID = unionID
 	}
 }
 
