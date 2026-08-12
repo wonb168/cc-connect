@@ -132,6 +132,9 @@ level = "info" # debug, info, warn, error
 # tool_title = true              # Rich-card transient tool titles: merge consecutive same-name tools as "Name ×N",
 #                                # clear the tool area once body text starts, leave no tool rows on the final card (default: true)
 #                                # 富卡片工具标题瞬态模式:连续同名工具合并为「Name ×N」,正文开始后清除,定稿不留痕(默认 true)
+# tool_title_disabled_platforms = []  # Platforms where tool_title's DingTalk/Slack streaming-card behavior is forced off
+#                                      # (e.g. ["dingtalk"] to keep Feishu's rich-card merging but disable it there); default: none excluded
+#                                      # 关闭 tool_title 在指定平台(DingTalk/Slack 流式卡片路径)的瞬态合并行为,如 ["dingtalk"];默认不排除任何平台
 # reply_footer_template = ""     # Override the rich-card footer layout. Non-empty replaces the built-in layout.
 #                                # Placeholders (missing values render empty): {ctx} {point} {cost_usd} {elapsed} {model} {effort} {tokens} {workdir}
 #                                # 自定义状态行模板,非空则完全覆盖默认布局;占位符缺值渲染为空串
@@ -1072,6 +1075,17 @@ app_secret = "your-feishu-app-secret"
 #                              # 都是独立事件，cc-connect 会在窗口内将它们合并成一条多图消息再分发；如果你的
 #                              # 网络或设备发送间隔超过 500ms 且仍被拆成多轮，可调高（如 800–1200ms）；如果
 #                              # 只是单图发送，希望响应更快，也可以适当调低。
+# save_unmentioned_attachments = false  # A file bubble can't carry an @mention, so a standalone file dropped
+#                                        # in a group can never pass the mention gate above; when true, archive
+#                                        # it to Chat/<chatID>/Inputs/ instead of dropping it (no agent turn, no
+#                                        # reply) so a later @bot turn can read it. Images are unaffected — they
+#                                        # can ride inside a @-mentioning rich-text post. Default false.
+#                                        # 文件气泡无法携带 @提及，群内独立发送的文件永远过不了上面的提及门槛；
+#                                        # 设为 true 时改为归档到 Chat/<chatID>/Inputs/（不触发 Agent 回合、不回复），
+#                                        # 供之后 @机器人 的回合读取。图片不受影响——图片可随 @提及 的富文本消息发送。默认 false。
+# archive_emoji = "THUMBSUP"            # Reaction added to acknowledge a silently-archived attachment
+#                                        # (save_unmentioned_attachments); set to "none" to disable.
+#                                        # 静默归档附件时添加的表情回复确认收到（save_unmentioned_attachments 生效时）；设为 "none" 可禁用。
 
 # Lark (International Version) / Lark 国际版
 # Lark now supports WebSocket long-connection too; webhook mode is only needed
@@ -1119,6 +1133,13 @@ app_secret = "your-feishu-app-secret"
 #                                 # 收到消息时添加的表情回复（默认 "🤔Thinking"）；设为 "none" 可禁用
 # done_emoji = "none"             # Emotion when agent finishes a reply (e.g. "🥳Done"); set to "none" to disable
 #                                 # Agent 完成回复后添加的表情回复（如 "🥳Done"）；设为 "none" 可禁用
+# card_template_id = ""          # AI Card template ID from the DingTalk developer console; empty = no card,
+#                                 # falls back to one independent message per event (tool spam, no editing)
+#                                 # AI 卡片模板 ID(钉钉开发者后台创建);留空则无卡片,退化为逐条独立消息(工具消息刷屏,且不可编辑)
+# card_template_key = "content"  # Must match the template's body variable name (default: "content")
+#                                 # 需与模板中正文变量名一致(默认 "content")
+# card_throttle_ms = 300          # Min ms between card content updates while streaming (default: 300)
+#                                 # 流式更新卡片内容的最小间隔毫秒数(默认 300)
 
 # WPS Xiezuo / WPS 协作 (uncomment to enable / 取消注释以启用)
 # 1. Create a WPS Open Platform app and enable event WebSocket delivery

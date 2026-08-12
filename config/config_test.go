@@ -429,6 +429,74 @@ func TestEffectiveDisplay_ProjectOverride(t *testing.T) {
 	}
 }
 
+func TestEffectiveToolTitleDisabledPlatforms(t *testing.T) {
+	tests := []struct {
+		name string
+		cfg  Config
+		proj ProjectConfig
+		want []string
+	}{
+		{
+			name: "both unset defaults to empty",
+			cfg:  Config{},
+			proj: ProjectConfig{},
+			want: nil,
+		},
+		{
+			name: "global only",
+			cfg: Config{
+				Display: DisplayConfig{ToolTitleDisabledPlatforms: []string{"dingtalk"}},
+			},
+			proj: ProjectConfig{},
+			want: []string{"dingtalk"},
+		},
+		{
+			name: "project overrides global (whole-list, not merged)",
+			cfg: Config{
+				Display: DisplayConfig{ToolTitleDisabledPlatforms: []string{"dingtalk"}},
+			},
+			proj: ProjectConfig{
+				Display: &DisplayConfig{ToolTitleDisabledPlatforms: []string{"slack"}},
+			},
+			want: []string{"slack"},
+		},
+		{
+			name: "project display set but field unset falls back to global",
+			cfg: Config{
+				Display: DisplayConfig{ToolTitleDisabledPlatforms: []string{"dingtalk"}},
+			},
+			proj: ProjectConfig{
+				Display: &DisplayConfig{},
+			},
+			want: []string{"dingtalk"},
+		},
+		{
+			name: "nil project behaves like empty project",
+			cfg: Config{
+				Display: DisplayConfig{ToolTitleDisabledPlatforms: []string{"dingtalk", "slack"}},
+			},
+			proj: ProjectConfig{},
+			want: []string{"dingtalk", "slack"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := EffectiveToolTitleDisabledPlatforms(&tt.cfg, &tt.proj)
+			if strings.Join(got, ",") != strings.Join(tt.want, ",") {
+				t.Errorf("EffectiveToolTitleDisabledPlatforms() = %#v, want %#v", got, tt.want)
+			}
+		})
+	}
+
+	t.Run("nil proj pointer behaves like empty project", func(t *testing.T) {
+		cfg := Config{Display: DisplayConfig{ToolTitleDisabledPlatforms: []string{"dingtalk"}}}
+		got := EffectiveToolTitleDisabledPlatforms(&cfg, nil)
+		if len(got) != 1 || got[0] != "dingtalk" {
+			t.Errorf("EffectiveToolTitleDisabledPlatforms(cfg, nil) = %#v, want [dingtalk]", got)
+		}
+	})
+}
+
 func TestEffectiveHistoryMaxLen(t *testing.T) {
 	globalLen, projectLen, unlimited := 800, 1200, 0
 

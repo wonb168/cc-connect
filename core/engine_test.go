@@ -15854,15 +15854,21 @@ func TestAgentSystemPrompt_DocumentsAudioVideoFlags(t *testing.T) {
 
 // --- Regression: streaming-card silent reply must not leak the NO_REPLY marker ---
 
-// recordingStreamCard captures the content passed to Finalize so tests can
-// assert what was rendered into the card.
+// recordingStreamCard captures the content passed to Update/Finalize so tests
+// can assert what was rendered into the card at each frame.
 type recordingStreamCard struct {
 	mu      sync.Mutex
 	final   bool
 	content string
+	updates []string
 }
 
-func (c *recordingStreamCard) Update(_ context.Context, _ string) error { return nil }
+func (c *recordingStreamCard) Update(_ context.Context, content string) error {
+	c.mu.Lock()
+	c.updates = append(c.updates, content)
+	c.mu.Unlock()
+	return nil
+}
 func (c *recordingStreamCard) Finalize(_ context.Context, content string) error {
 	c.mu.Lock()
 	c.final = true
@@ -15880,6 +15886,13 @@ func (c *recordingStreamCard) finalContent() string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.content
+}
+func (c *recordingStreamCard) updateSnapshot() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	cp := make([]string, len(c.updates))
+	copy(cp, c.updates)
+	return cp
 }
 
 // recordingStreamCardPlatform is a StreamingCardPlatform whose card records the
@@ -15926,5 +15939,365 @@ func TestProcessInteractiveEvents_StreamingCard_BareNoReply_Suppressed(t *testin
 	}
 	if strings.Contains(card.finalContent(), "NO_REPLY") {
 		t.Fatalf("silent reply leaked NO_REPLY into the streaming card: %q", card.finalContent())
+	}
+}
+
+// --- DingTalk/Slack tool-title alignment (StreamingCardPlatform path) ---
+
+// TestAppendCardToolEntry_MergesConsecutiveSameNameTools mirrors
+// TestEngine_AppendToolStep's merge-counting behavior for the
+// StreamingCardPlatform path's cardToolEntry, per decision #7/#10 of
+// docs/plans/2026-08-07-dingtalk-tool-title.md.
+func TestAppendCardToolEntry_MergesConsecutiveSameNameTools(t *testing.T) {
+	var entries []cardToolEntry
+	entries = appendCardToolEntry(entries, 1, "Bash", "", true)
+	entries = appendCardToolEntry(entries, 2, "Bash", "", true)
+	entries = appendCardToolEntry(entries, 3, "Bash", "", true)
+	if len(entries) != 1 {
+		t.Fatalf("consecutive same-name tools should merge into one entry, got %d entries: %#v", len(entries), entries)
+	}
+	if entries[0].Count != 3 {
+		t.Fatalf("Count = %d, want 3", entries[0].Count)
+	}
+
+	// A different tool name starts a new entry.
+	entries = appendCardToolEntry(entries, 4, "Read", "", true)
+	if len(entries) != 2 {
+		t.Fatalf("different tool name should not merge, got %d entries: %#v", len(entries), entries)
+	}
+	if entries[1].Count != 1 {
+		t.Fatalf("new entry Count = %d, want 1", entries[1].Count)
+	}
+
+	// Bash again after Read does not reach back to the first Bash entry.
+	entries = appendCardToolEntry(entries, 5, "Bash", "", true)
+	if len(entries) != 3 {
+		t.Fatalf("non-consecutive same-name tool should not merge across a different entry, got %d entries: %#v", len(entries), entries)
+	}
+}
+
+// TestAppendCardToolEntry_TitleOnlyFalseNeverMerges verifies that when the
+// tool-title toggle is off for this platform, every call appends a new
+// Count-1 entry — the legacy "Tool #N" behavior — regardless of repeated
+// names.
+func TestAppendCardToolEntry_TitleOnlyFalseNeverMerges(t *testing.T) {
+	var entries []cardToolEntry
+	entries = appendCardToolEntry(entries, 1, "Bash", "`ls`", false)
+	entries = appendCardToolEntry(entries, 2, "Bash", "`pwd`", false)
+	if len(entries) != 2 {
+		t.Fatalf("toggle off should never merge, got %d entries: %#v", len(entries), entries)
+	}
+	for i, e := range entries {
+		if e.Count != 1 {
+			t.Errorf("entries[%d].Count = %d, want 1", i, e.Count)
+		}
+		if e.TitleOnly {
+			t.Errorf("entries[%d].TitleOnly = true, want false", i)
+		}
+	}
+}
+
+// TestBuildCardContent_TitleOnlyRendersNameAndCountNoInput verifies decision
+// #6/#8/#10: title-only rows render bare tool name (Count 1) or "Name ×N"
+// (Count > 1), no "Tool #N" prefix, no input block — regardless of whether
+// this row actually merged.
+func TestBuildCardContent_TitleOnlyRendersNameAndCountNoInput(t *testing.T) {
+	content := buildCardContent("", []cardToolEntry{
+		{Index: 1, Name: "Bash", Input: "```bash\nls\n```", Count: 3, TitleOnly: true},
+	}, "")
+	if !strings.Contains(content, "Bash ×3") {
+		t.Fatalf("expected merged title %q, got %q", "Bash ×3", content)
+	}
+	if strings.Contains(content, "Tool #") {
+		t.Fatalf("title-only rendering must not include the Tool #N prefix, got %q", content)
+	}
+	if strings.Contains(content, "```bash") || strings.Contains(content, "ls") {
+		t.Fatalf("title-only rendering must not include input detail, got %q", content)
+	}
+
+	// Count 1 (no repeat) still renders title-only, unconditionally on the
+	// toggle rather than only when merging actually happened (decision #10).
+	single := buildCardContent("", []cardToolEntry{
+		{Index: 1, Name: "Read", Input: "`file.go`", Count: 1, TitleOnly: true},
+	}, "")
+	if !strings.Contains(single, "`Read`") {
+		t.Fatalf("expected bare title %q, got %q", "`Read`", single)
+	}
+	if strings.Contains(single, "×") {
+		t.Fatalf("Count 1 must not render an ×N suffix, got %q", single)
+	}
+	if strings.Contains(single, "file.go") {
+		t.Fatalf("title-only rendering must not include input detail even at Count 1, got %q", single)
+	}
+}
+
+// TestBuildCardContent_LegacyRenderingUnchangedWhenToggleOff locks in that
+// disabling the toggle preserves the original "Tool #N" + input rendering
+// (upstream behavior for platforms/configs that keep it disabled).
+func TestBuildCardContent_LegacyRenderingUnchangedWhenToggleOff(t *testing.T) {
+	content := buildCardContent("", []cardToolEntry{
+		{Index: 1, Name: "Bash", Input: "```bash\nls\n```", Count: 1, TitleOnly: false},
+	}, "")
+	for _, want := range []string{"Tool #1", "`Bash`", "```bash", "ls"} {
+		if !strings.Contains(content, want) {
+			t.Fatalf("legacy rendering missing %q, got %q", want, content)
+		}
+	}
+}
+
+// TestProcessInteractiveEvents_StreamingCard_MergesConsecutiveToolCalls is an
+// integration-level check that the full processInteractiveEvents path merges
+// consecutive same-name EventToolUse events into one title-only row on the
+// DingTalk/Slack StreamingCardPlatform path, absorbs EventToolResult without
+// a standalone send, clears the tool area on first body text, and leaves no
+// tool rows on the finalized card.
+func TestProcessInteractiveEvents_StreamingCard_MergesConsecutiveToolCalls(t *testing.T) {
+	card := &recordingStreamCard{}
+	p := &recordingStreamCardPlatform{
+		stubPlatformEngine: stubPlatformEngine{n: "dingtalk"},
+		card:               card,
+	}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	e.SetDisplayConfig(DisplayCfg{
+		Mode:         "full",
+		ToolMessages: true,
+		ToolMaxLen:   500,
+	})
+	sessionKey := "dingtalk:user-streamcard-merge"
+	session := e.sessions.GetOrCreateActive(sessionKey)
+	agentSession := newControllableSession("s-streamcard-merge")
+	state := &interactiveState{
+		agentSession: agentSession,
+		platform:     p,
+		replyCtx:     "ctx-streamcard-merge",
+	}
+	e.interactiveStates[sessionKey] = state
+
+	code := 0
+	success := true
+	agentSession.events <- Event{Type: EventToolUse, ToolName: "Bash", ToolInput: "echo one"}
+	agentSession.events <- Event{Type: EventToolResult, ToolName: "Bash", ToolResult: "one", ToolStatus: "completed", ToolExitCode: &code, ToolSuccess: &success}
+	agentSession.events <- Event{Type: EventToolUse, ToolName: "Bash", ToolInput: "echo two"}
+	agentSession.events <- Event{Type: EventToolUse, ToolName: "Bash", ToolInput: "echo three"}
+	agentSession.events <- Event{Type: EventText, Content: "all done"}
+	agentSession.events <- Event{Type: EventResult, Content: "all done", Done: true}
+
+	e.processInteractiveEvents(state, session, e.sessions, sessionKey, "m-streamcard-merge", time.Now(), nil, nil, state.replyCtx)
+
+	sent := p.getSent()
+	if len(sent) != 0 {
+		t.Fatalf("EventToolResult must be absorbed into the card, not sent standalone; got %d standalone sends: %#v", len(sent), sent)
+	}
+
+	updates := card.updateSnapshot()
+	if len(updates) == 0 {
+		t.Fatalf("expected at least one card Update during streaming")
+	}
+	// After the second and third Bash call, the merged row must show ×3 —
+	// input detail must never appear (decision #6/#8/#10).
+	lastToolFrame := updates[len(updates)-1]
+	for _, frame := range updates {
+		if strings.Contains(frame, "Tool #") {
+			t.Fatalf("title-only rendering must never include the Tool #N prefix; frame: %q", frame)
+		}
+		if strings.Contains(frame, "echo") {
+			t.Fatalf("title-only rendering must never include tool input; frame: %q", frame)
+		}
+	}
+	foundMergedRow := false
+	for _, frame := range updates {
+		if strings.Contains(frame, "Bash ×3") {
+			foundMergedRow = true
+			break
+		}
+	}
+	if !foundMergedRow {
+		t.Fatalf("expected a frame with merged row %q; last frame: %q; all frames: %#v", "Bash ×3", lastToolFrame, updates)
+	}
+
+	if !card.finalized() {
+		t.Fatalf("expected streaming card to be finalized")
+	}
+	final := card.finalContent()
+	if strings.Contains(final, "🔧") || strings.Contains(final, "Bash") {
+		t.Fatalf("finalized card must carry no tool rows at all, got %q", final)
+	}
+	if !strings.Contains(final, "all done") {
+		t.Fatalf("finalized card must keep the body text, got %q", final)
+	}
+}
+
+// TestProcessInteractiveEvents_StreamingCard_ToolTitleDisabledPerPlatform
+// verifies the tool_title_disabled_platforms toggle (decision #7): with the
+// platform in the disabled list, the StreamingCardPlatform path falls back to
+// legacy per-call "Tool #N" rendering even though the global toggle is on.
+func TestProcessInteractiveEvents_StreamingCard_ToolTitleDisabledPerPlatform(t *testing.T) {
+	card := &recordingStreamCard{}
+	p := &recordingStreamCardPlatform{
+		stubPlatformEngine: stubPlatformEngine{n: "dingtalk"},
+		card:               card,
+	}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	e.SetDisplayConfig(DisplayCfg{
+		Mode:         "full",
+		ToolMessages: true,
+		ToolMaxLen:   500,
+	})
+	// Global toggle stays on (default); only "dingtalk" is disabled.
+	e.SetToolTitleDisabledPlatforms([]string{"dingtalk"})
+	sessionKey := "dingtalk:user-streamcard-disabled"
+	session := e.sessions.GetOrCreateActive(sessionKey)
+	agentSession := newControllableSession("s-streamcard-disabled")
+	state := &interactiveState{
+		agentSession: agentSession,
+		platform:     p,
+		replyCtx:     "ctx-streamcard-disabled",
+	}
+	e.interactiveStates[sessionKey] = state
+
+	agentSession.events <- Event{Type: EventToolUse, ToolName: "Bash", ToolInput: "echo one"}
+	agentSession.events <- Event{Type: EventToolUse, ToolName: "Bash", ToolInput: "echo two"}
+	agentSession.events <- Event{Type: EventText, Content: "done"}
+	agentSession.events <- Event{Type: EventResult, Content: "done", Done: true}
+
+	e.processInteractiveEvents(state, session, e.sessions, sessionKey, "m-streamcard-disabled", time.Now(), nil, nil, state.replyCtx)
+
+	updates := card.updateSnapshot()
+	if len(updates) == 0 {
+		t.Fatalf("expected at least one card Update during streaming")
+	}
+	found := false
+	for _, frame := range updates {
+		if strings.Contains(frame, "Tool #1") && strings.Contains(frame, "Tool #2") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected legacy per-call Tool #N rendering when platform is disabled; frames: %#v", updates)
+	}
+	// Legacy mode also keeps rows on the finalized card (upstream behavior).
+	final := card.finalContent()
+	if !strings.Contains(final, "Bash") {
+		t.Fatalf("legacy (disabled) mode should preserve tool rows on the final card, got %q", final)
+	}
+}
+
+// TestProcessInteractiveEvents_StreamingCard_ToolAreaClearsOnFirstBodyText
+// verifies decision #4/#9: the tool area clears once (on the FIRST body-text
+// event of the turn), a later tool call re-accumulates a fresh area, and a
+// second body-text event does not re-clear that fresh area.
+func TestProcessInteractiveEvents_StreamingCard_ToolAreaClearsOnFirstBodyText(t *testing.T) {
+	card := &recordingStreamCard{}
+	p := &recordingStreamCardPlatform{
+		stubPlatformEngine: stubPlatformEngine{n: "slack"},
+		card:               card,
+	}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	e.SetDisplayConfig(DisplayCfg{
+		Mode:         "full",
+		ToolMessages: true,
+		ToolMaxLen:   500,
+	})
+	sessionKey := "slack:user-streamcard-clear"
+	session := e.sessions.GetOrCreateActive(sessionKey)
+	agentSession := newControllableSession("s-streamcard-clear")
+	state := &interactiveState{
+		agentSession: agentSession,
+		platform:     p,
+		replyCtx:     "ctx-streamcard-clear",
+	}
+	e.interactiveStates[sessionKey] = state
+
+	agentSession.events <- Event{Type: EventToolUse, ToolName: "Bash", ToolInput: "echo one"}
+	agentSession.events <- Event{Type: EventText, Content: "first "}
+	agentSession.events <- Event{Type: EventToolUse, ToolName: "Read", ToolInput: "file.go"}
+	agentSession.events <- Event{Type: EventText, Content: "second"}
+	agentSession.events <- Event{Type: EventResult, Content: "first second", Done: true}
+
+	e.processInteractiveEvents(state, session, e.sessions, sessionKey, "m-streamcard-clear", time.Now(), nil, nil, state.replyCtx)
+
+	updates := card.updateSnapshot()
+	if len(updates) == 0 {
+		t.Fatalf("expected at least one card Update during streaming")
+	}
+	// After "first " but before the Read call, the Bash row must be gone
+	// from the tool area (cleared on first body text this turn).
+	var afterFirstText string
+	for _, frame := range updates {
+		if strings.Contains(frame, "first") {
+			afterFirstText = frame
+			break
+		}
+	}
+	if afterFirstText == "" {
+		t.Fatalf("no frame captured the first body-text update; frames: %#v", updates)
+	}
+	if strings.Contains(afterFirstText, "Bash") {
+		t.Fatalf("tool area should be cleared once body text starts, got %q", afterFirstText)
+	}
+	// After the second tool call (Read), a fresh tool area must reappear.
+	var afterReadCall string
+	for _, frame := range updates {
+		if strings.Contains(frame, "Read") {
+			afterReadCall = frame
+			break
+		}
+	}
+	if afterReadCall == "" {
+		t.Fatalf("expected the tool area to reappear for the Read call; frames: %#v", updates)
+	}
+
+	final := card.finalContent()
+	if strings.Contains(final, "Read") || strings.Contains(final, "🔧") {
+		t.Fatalf("finalized card must carry no tool rows at all, got %q", final)
+	}
+	if !strings.Contains(final, "first second") {
+		t.Fatalf("finalized card must keep the full body text, got %q", final)
+	}
+}
+
+// TestProcessInteractiveEvents_StreamingCard_SecondToolBatchAfterTextClearedOnFinalize
+// covers the finalCardToolCalls unconditional-finalize guarantee: a turn
+// shaped Tool→Text→Tool→Result (a second tool batch AFTER body text, with no
+// further text before the turn ends) must not leave that second batch
+// stranded on the finalized card. The once-per-turn clear-on-first-text logic
+// only fires once, so this second batch depends on the finalize-time
+// unconditional clear (mirrors Feishu's finalToolSteps).
+func TestProcessInteractiveEvents_StreamingCard_SecondToolBatchAfterTextClearedOnFinalize(t *testing.T) {
+	card := &recordingStreamCard{}
+	p := &recordingStreamCardPlatform{
+		stubPlatformEngine: stubPlatformEngine{n: "dingtalk"},
+		card:               card,
+	}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	e.SetDisplayConfig(DisplayCfg{
+		Mode:         "full",
+		ToolMessages: true,
+		ToolMaxLen:   500,
+	})
+	sessionKey := "dingtalk:user-streamcard-finalize-guard"
+	session := e.sessions.GetOrCreateActive(sessionKey)
+	agentSession := newControllableSession("s-streamcard-finalize-guard")
+	state := &interactiveState{
+		agentSession: agentSession,
+		platform:     p,
+		replyCtx:     "ctx-streamcard-finalize-guard",
+	}
+	e.interactiveStates[sessionKey] = state
+
+	agentSession.events <- Event{Type: EventToolUse, ToolName: "Bash", ToolInput: "echo one"}
+	agentSession.events <- Event{Type: EventText, Content: "here is the plan"}
+	agentSession.events <- Event{Type: EventToolUse, ToolName: "Edit", ToolInput: "apply patch"}
+	agentSession.events <- Event{Type: EventResult, Content: "here is the plan", Done: true}
+
+	e.processInteractiveEvents(state, session, e.sessions, sessionKey, "m-streamcard-finalize-guard", time.Now(), nil, nil, state.replyCtx)
+
+	final := card.finalContent()
+	if strings.Contains(final, "Edit") || strings.Contains(final, "🔧") {
+		t.Fatalf("finalized card must not strand the second tool batch after body text, got %q", final)
+	}
+	if !strings.Contains(final, "here is the plan") {
+		t.Fatalf("finalized card must keep the body text, got %q", final)
 	}
 }

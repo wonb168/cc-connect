@@ -110,6 +110,12 @@ type replyContext struct {
 	messageID  string
 	chatID     string
 	sessionKey string
+	// saveOnly marks this context as carrying a save-only attachment (e.g. an
+	// un-mentioned group file routed through the save_unmentioned_attachments
+	// gate). dispatchMessage threads it onto core.Message.SaveOnly so the engine
+	// archives the file without an agent turn. Zero-value false keeps every
+	// existing call site (and tests) on the normal agent-dispatch path.
+	saveOnly bool
 }
 
 type Platform struct {
@@ -130,6 +136,14 @@ type Platform struct {
 	respondToAtEveryoneAndHere bool
 	shareSessionInChannel      bool
 	threadIsolation            bool
+	// saveUnmentionedAttachments: when true, a file message that arrives in a
+	// group without an @mention (which the Feishu protocol forbids attaching to
+	// a file bubble) is archived to the per-chat Inputs dir via a save-only
+	// dispatch instead of being dropped at the mention gate. No agent turn runs.
+	saveUnmentionedAttachments bool
+	// archiveEmoji is the reaction added to acknowledge a silently-archived
+	// attachment. "" disables the reaction. Default "THUMBSUP".
+	archiveEmoji string
 	// sessionUseUnionID selects union_id (the in-domain uid) over open_id for
 	// the user segment of the session key. Default true. See CONTEXT.md
 	// "隔离与会话记录模型": identity is uid=union_id for isolation, while
@@ -317,6 +331,14 @@ func newPlatform(name, domain string, opts map[string]any) (core.Platform, error
 	respondToAtEveryoneAndHere, _ := opts["respond_to_at_everyone_and_here"].(bool)
 	shareSessionInChannel, _ := opts["share_session_in_channel"].(bool)
 	threadIsolation, _ := opts["thread_isolation"].(bool)
+	saveUnmentionedAttachments, _ := opts["save_unmentioned_attachments"].(bool)
+	archiveEmoji, _ := opts["archive_emoji"].(string)
+	if archiveEmoji == "" {
+		archiveEmoji = "THUMBSUP"
+	}
+	if archiveEmoji == "none" {
+		archiveEmoji = ""
+	}
 	// Default true (opt-out): use union_id as the session identity. Set
 	// session_use_union_id=false to fall back to open_id (upstream behavior).
 	sessionUseUnionID := true
@@ -414,6 +436,8 @@ func newPlatform(name, domain string, opts map[string]any) (core.Platform, error
 		respondToAtEveryoneAndHere: respondToAtEveryoneAndHere,
 		shareSessionInChannel:      shareSessionInChannel,
 		threadIsolation:            threadIsolation,
+		saveUnmentionedAttachments: saveUnmentionedAttachments,
+		archiveEmoji:               archiveEmoji,
 		sessionUseUnionID:          sessionUseUnionID,
 		resolveMentions:            resolveMentionsOpt,
 		noReplyToTrigger:           noReplyToTrigger,
@@ -932,6 +956,18 @@ func (p *Platform) addReactionWithEmoji(messageID, emojiType string) string {
 	return ""
 }
 
+// AddReactionToMessage implements core.MessageReactionAdder. It adds the
+// configured archiveEmoji to an inbound message as a best-effort receipt
+// acknowledgment for silently-archived attachments. Used by the engine's
+// save-only path so a sender sees their file was received without an agent
+// reply. Failures are debug-logged and ignored.
+func (p *Platform) AddReactionToMessage(messageID string) {
+	if p.archiveEmoji == "" || messageID == "" {
+		return
+	}
+	p.addReactionWithEmoji(messageID, p.archiveEmoji)
+}
+
 func (p *Platform) removeReaction(messageID, reactionID string) {
 	if reactionID == "" || messageID == "" {
 		return
@@ -1372,6 +1408,12 @@ func (p *Platform) onMessage(ctx context.Context, event *larkim.P2MessageReceive
 	// thread set; sessionKey is also used downstream for dispatch.
 	sessionKey := p.makeSessionKey(msg, chatID, userID, unionID)
 
+	// archiveOnly is set by the save_unmentioned_attachments gate case below for
+	// file messages that arrive in a group without an @mention; it is threaded
+	// onto rctx.saveOnly so dispatchMessage marks the core.Message SaveOnly and
+	// the engine archives the file without an agent turn.
+	archiveOnly := false
+
 	if chatType == "group" && !p.groupReplyAll && p.getBotOpenID() != "" {
 		if !isBotMentioned(msg.Mentions, p.getBotOpenID()) {
 			switch {
@@ -1386,6 +1428,17 @@ func (p *Platform) onMessage(ctx context.Context, event *larkim.P2MessageReceive
 			case p.threadIsolation && isAttachmentMsgType(msgType) && p.isActiveThreadSession(sessionKey):
 				slog.Debug(p.tag()+": passing attachment through active thread without mention",
 					"chat_id", chatID, "session_key", sessionKey, "msg_type", msgType, "message_id", messageID)
+			// A file bubble in Feishu cannot carry an @mention, so a standalone
+			// file in a group can never pass the mention gate. With
+			// save_unmentioned_attachments enabled, route it to the save-only
+			// path: the file is archived to the per-chat Inputs dir (ready for a
+			// later @bot turn to read) but no agent turn runs and no reply is
+			// sent. Scoped to "file" only — images can ride inside a @-mentioning
+			// rich-text post, so they don't need this escape hatch.
+			case p.saveUnmentionedAttachments && msgType == "file":
+				slog.Debug(p.tag()+": archiving un-mentioned group file (save-only)",
+					"chat_id", chatID, "message_id", messageID)
+				archiveOnly = true
 			default:
 				slog.Debug(p.tag()+": ignoring group message without bot mention", "chat_id", chatID)
 				return nil
@@ -1421,7 +1474,7 @@ func (p *Platform) onMessage(ctx context.Context, event *larkim.P2MessageReceive
 	mentions := msg.Mentions
 	parentID := stringValue(msg.ParentId)
 
-	rctx := replyContext{messageID: messageID, chatID: chatID, sessionKey: sessionKey}
+	rctx := replyContext{messageID: messageID, chatID: chatID, sessionKey: sessionKey, saveOnly: archiveOnly}
 	slog.Debug(p.tag()+": routed inbound message",
 		"message_id", messageID,
 		"session_key", sessionKey,
@@ -1611,8 +1664,12 @@ func (p *Platform) dispatchMessage(ctx context.Context, msgType, content string,
 		fileData, err := p.downloadResource(messageID, fileBody.FileKey, "file")
 		if err != nil {
 			slog.Error(p.tag()+": download file failed", "error", err)
-			if sendErr := p.Send(ctx, rctx, "⚠️ File download failed (network error). Please resend."); sendErr != nil {
-				slog.Error(p.tag()+": failed to notify user about file download failure", "error", sendErr)
+			// A save-only archive is silent by design — don't surface a download
+			// failure to a group where the sender never @'d the bot.
+			if !rctx.saveOnly {
+				if sendErr := p.Send(ctx, rctx, "⚠️ File download failed (network error). Please resend."); sendErr != nil {
+					slog.Error(p.tag()+": failed to notify user about file download failure", "error", sendErr)
+				}
 			}
 			return
 		}
@@ -1627,6 +1684,7 @@ func (p *Platform) dispatchMessage(ctx context.Context, msgType, content string,
 				Data:     fileData,
 				FileName: fileBody.FileName,
 			}},
+			SaveOnly:          rctx.saveOnly,
 			ReplyCtx:          rctx,
 			UserMessageTimeMs: createTimeMs,
 		})

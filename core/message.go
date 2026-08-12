@@ -387,6 +387,13 @@ type Message struct {
 	// drop late redeliveries that reuse a new message_id but an older create_time
 	// than a message already processed. Zero means unset (no ordering hint).
 	UserMessageTimeMs int64
+	// SaveOnly is set by platforms for attachment-only messages that should be
+	// archived to the per-chat Inputs directory WITHOUT spawning an agent turn.
+	// Example: a file dropped in a Feishu group cannot carry an @mention, so it
+	// fails the mention gate; with save_unmentioned_attachments enabled the
+	// platform marks it SaveOnly so the engine writes it to disk (where a later
+	// @bot turn can read it) and returns — no reply, no agent session touched.
+	SaveOnly bool
 }
 
 // EventType distinguishes different kinds of agent output.

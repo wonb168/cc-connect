@@ -111,7 +111,7 @@ func (cs *claudeSession) attachmentsRoot() string {
 	chatID := cs.scope.ChatID
 	cs.scopeMu.Unlock()
 	if chatID != "" {
-		return filepath.Join(cs.workDir, "Chat", sanitizePathSegment(chatID), "Inputs")
+		return core.ScopedAttachmentsDir(cs.workDir, chatID)
 	}
 	return filepath.Join(cs.workDir, ".cc-connect", "attachments")
 }

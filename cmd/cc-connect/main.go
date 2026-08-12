@@ -452,6 +452,7 @@ func main() {
 		engine.SetPointRatio(config.EffectivePointRatio(cfg, &proj))
 		engine.SetStripFunctionCalls(config.EffectiveStripFunctionCalls(cfg, &proj))
 		engine.SetToolTitleTransient(config.EffectiveToolTitle(cfg, &proj))
+		engine.SetToolTitleDisabledPlatforms(config.EffectiveToolTitleDisabledPlatforms(cfg, &proj))
 		engine.SetUsageRecorderEndpoint(config.EffectiveUsageRecorderEndpoint(cfg, &proj))
 		engine.SetAttachmentSendEnabled(cfg.AttachmentSend != "off")
 		engine.SetFilterExternalSessions(proj.FilterExternalSessions != nil && *proj.FilterExternalSessions)
@@ -1740,6 +1741,7 @@ func reloadConfig(configPath, projName string, engine *core.Engine) (*core.Confi
 	engine.SetPointRatio(config.EffectivePointRatio(cfg, proj))
 	engine.SetStripFunctionCalls(config.EffectiveStripFunctionCalls(cfg, proj))
 	engine.SetToolTitleTransient(config.EffectiveToolTitle(cfg, proj))
+	engine.SetToolTitleDisabledPlatforms(config.EffectiveToolTitleDisabledPlatforms(cfg, proj))
 	engine.SetUsageRecorderEndpoint(config.EffectiveUsageRecorderEndpoint(cfg, proj))
 
 	// Reload auto-compress settings

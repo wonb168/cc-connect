@@ -271,6 +271,17 @@ type TypingIndicatorDone interface {
 	AddDoneReaction(replyCtx any)
 }
 
+// MessageReactionAdder is an optional interface for platforms that can add an
+// emoji reaction to a specific inbound message by its message ID. The engine
+// uses it to acknowledge a silently-archived attachment (Message.SaveOnly)
+// without producing a reply — e.g. a 👍 on a file dropped in a Feishu group so
+// the sender knows it was received, even though no agent turn ran. The
+// implementation chooses the emoji (see Feishu archive_emoji) and must be
+// best-effort: failures are logged and never disrupt the archive.
+type MessageReactionAdder interface {
+	AddReactionToMessage(messageID string)
+}
+
 // AtMentionSender is an optional interface for platforms that support @mention in
 // reply messages (e.g. DingTalk). Platforms that implement this interface can
 // include @user notifications when replying in group chats.

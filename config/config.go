@@ -221,6 +221,15 @@ type DisplayConfig struct {
 	// text starts, and keep no tool rows on the finalized card).
 	// Default true. Nil = default true.
 	ToolTitle *bool `toml:"tool_title,omitempty"`
+	// ToolTitleDisabledPlatforms lists platform names (case-insensitive) for
+	// which ToolTitle's StreamingCardPlatform-path behavior (DingTalk/Slack —
+	// see core.cardToolEntry/buildCardContent) is forced off even when
+	// ToolTitle is on. Independent from ToolTitle itself so a regression in
+	// the newer DingTalk/Slack implementation doesn't force disabling the
+	// battle-tested Feishu rich-card path too. Same shape as
+	// StreamPreviewConfig.DisabledPlatforms. Default empty (no platforms
+	// excluded).
+	ToolTitleDisabledPlatforms []string `toml:"tool_title_disabled_platforms,omitempty"`
 }
 
 // StreamPreviewConfig controls real-time streaming preview in IM.
@@ -1106,6 +1115,22 @@ func EffectiveToolTitle(cfg *Config, proj *ProjectConfig) bool {
 		return *cfg.Display.ToolTitle
 	}
 	return true
+}
+
+// EffectiveToolTitleDisabledPlatforms resolves the platform names excluded
+// from ToolTitle's StreamingCardPlatform-path rendering. Project
+// [projects.display] takes precedence over global [display] (whole-list
+// override, not merged); defaults to empty (no platforms excluded) when unset
+// at both levels.
+func EffectiveToolTitleDisabledPlatforms(cfg *Config, proj *ProjectConfig) []string {
+	var projDisp *DisplayConfig
+	if proj != nil {
+		projDisp = proj.Display
+	}
+	if projDisp != nil && projDisp.ToolTitleDisabledPlatforms != nil {
+		return projDisp.ToolTitleDisabledPlatforms
+	}
+	return cfg.Display.ToolTitleDisabledPlatforms
 }
 
 // validatePermissive is like validate but skips the "at least one platform"

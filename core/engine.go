@@ -425,6 +425,13 @@ type Engine struct {
 	// cleared once body text starts, and the finalized card keeps no tool rows.
 	// Default true. When false, the upstream toolSteps behavior is preserved.
 	toolTitleTransient bool
+	// toolTitleDisabledPlatforms lists platform names (case-insensitive) for
+	// which the StreamingCardPlatform path's (DingTalk/Slack) transient
+	// tool-title rendering is forced off even when toolTitleTransient is
+	// true — mirrors streamPreview's DisabledPlatforms precedent. Default nil
+	// (no platforms excluded). Feishu's rich-card path is unaffected by this
+	// list; it reads toolTitleTransient directly.
+	toolTitleDisabledPlatforms []string
 	// usageRecorderEndpoint, when non-empty, receives a best-effort POST of each
 	// completed turn's usage + cost (fire-and-forget). Empty = disabled.
 	usageRecorderEndpoint string
@@ -1010,6 +1017,34 @@ func (e *Engine) SetToolTitleTransient(enabled bool) {
 	e.toolTitleTransient = enabled
 }
 
+// SetToolTitleDisabledPlatforms sets the platform names (case-insensitive)
+// for which the StreamingCardPlatform path's transient tool-title rendering
+// is forced off, independent of the global toolTitleTransient toggle. Default
+// nil (no platforms excluded).
+func (e *Engine) SetToolTitleDisabledPlatforms(platforms []string) {
+	e.toolTitleDisabledPlatforms = platforms
+}
+
+// toolTitleEnabledFor reports whether transient tool-title rendering should
+// apply to the StreamingCardPlatform path (cardToolEntry/buildCardContent)
+// for the given platform: the global toggle is on AND the platform is not in
+// the disabled list.
+func (e *Engine) toolTitleEnabledFor(p Platform) bool {
+	if !e.toolTitleTransient {
+		return false
+	}
+	if p == nil {
+		return true
+	}
+	name := p.Name()
+	for _, disabled := range e.toolTitleDisabledPlatforms {
+		if strings.EqualFold(disabled, name) {
+			return false
+		}
+	}
+	return true
+}
+
 // appendToolStep appends a tool progress row, merging into the previous row's
 // Count when transient tool titles are enabled and the previous row is a tool
 // of the same name (Q15/Q18甲: consecutive same-name tools coalesce). Returns
@@ -1046,6 +1081,22 @@ func (e *Engine) finalToolSteps(steps []ToolStep) []ToolStep {
 		return nil
 	}
 	return steps
+}
+
+// finalCardToolCalls returns the tool entries to render on the FINALIZED
+// StreamingCardPlatform card (DingTalk/Slack). Mirrors finalToolSteps: with
+// transient tool titles enabled for this platform, the final card keeps no
+// tool rows at all — unconditionally, not just when the last event before
+// finalize was body text. A turn shaped Tool→Text→Tool→Result (a second
+// batch of tool calls after body text, with no further text before the turn
+// ends) would otherwise leave that second batch stranded in the finalized
+// card, since the EventText clear-on-first-body-text logic only fires once
+// per turn.
+func (e *Engine) finalCardToolCalls(p Platform, entries []cardToolEntry) []cardToolEntry {
+	if e.toolTitleEnabledFor(p) {
+		return nil
+	}
+	return entries
 }
 
 // sanitizeAssistantText applies the fork's assistant-text sanitizers (currently
@@ -2831,9 +2882,54 @@ func (e *Engine) startMessageRecallMonitor(sessionKey string) context.CancelFunc
 	return cancel
 }
 
+// archiveAttachments handles a save-only message: it writes the carried file
+// attachments to the per-chat Inputs directory (the same directory
+// claudeSession.attachmentsRoot reads from, via core.ScopedAttachmentsDir) and
+// returns without ever starting an agent session or sending a reply. A
+// best-effort emoji reaction acknowledges receipt when the platform supports
+// core.MessageReactionAdder. This is what makes "a file dropped in a Feishu
+// group" (which can't carry an @mention) land on disk so a later @bot turn can
+// read it — with zero noise and no change to session semantics.
+func (e *Engine) archiveAttachments(p Platform, msg *Message) {
+	if len(msg.Files) == 0 {
+		return
+	}
+	workDir := ""
+	if wd, ok := e.agent.(interface{ GetWorkDir() string }); ok {
+		workDir = wd.GetWorkDir()
+	}
+	if workDir == "" {
+		workDir = e.baseWorkDir
+	}
+	if workDir == "" {
+		workDir, _ = os.Getwd()
+	}
+	scope := ScopeFromSessionKey(msg.SessionKey)
+	baseDir := ScopedAttachmentsDir(workDir, scope.ChatID)
+	paths := SaveFilesToBaseDir(baseDir, msg.MessageID, msg.Files)
+	slog.Info("attachment archived (save-only, no agent turn)",
+		"platform", msg.Platform, "msg_id", msg.MessageID,
+		"session", msg.SessionKey, "chat_id", scope.ChatID,
+		"files", len(paths), "dir", baseDir)
+	if len(paths) > 0 {
+		if ra, ok := p.(MessageReactionAdder); ok {
+			ra.AddReactionToMessage(msg.MessageID)
+		}
+	}
+}
+
 func (e *Engine) handleMessage(p Platform, msg *Message) {
 	if msg.Recalled {
 		e.handleMessageRecall(p, msg)
+		return
+	}
+
+	// Save-only path: archive attachments to the per-chat Inputs dir without an
+	// agent turn. Platforms set msg.SaveOnly for attachment-only messages that
+	// should be stored for a later @bot turn but must not trigger a reply now
+	// (e.g. a file dropped in a Feishu group, which cannot carry an @mention).
+	if msg.SaveOnly {
+		e.archiveAttachments(p, msg)
 		return
 	}
 
@@ -4466,6 +4562,43 @@ type cardToolEntry struct {
 	Index int
 	Name  string
 	Input string
+	// Count is how many consecutive same-name tool invocations this entry
+	// represents (>=1). Only incremented when TitleOnly is true — see
+	// appendCardToolEntry. Zero is treated as 1 for backward compatibility.
+	Count int
+	// TitleOnly, when true, asks buildCardContent to render only this entry's
+	// title (e.g. "Bash ×3") and omit the "Tool #N" sequence prefix and input
+	// block. Set by appendCardToolEntry when transient tool titles are
+	// enabled for this platform.
+	TitleOnly bool
+}
+
+// appendCardToolEntry appends a tool-call record for the StreamingCardPlatform
+// path (DingTalk/Slack), merging into the previous entry's Count when
+// titleOnly is true and the previous entry is a tool of the same name —
+// mirrors appendToolStep's merge behavior for Feishu's rich-card path.
+// Otherwise appends a new entry with Count 1. Returns the updated slice.
+func appendCardToolEntry(entries []cardToolEntry, index int, name, input string, titleOnly bool) []cardToolEntry {
+	if titleOnly && len(entries) > 0 {
+		last := &entries[len(entries)-1]
+		if last.Name == name {
+			if last.Count < 1 {
+				last.Count = 1
+			}
+			last.Count++
+			if input != "" {
+				last.Input = input
+			}
+			return entries
+		}
+	}
+	return append(entries, cardToolEntry{
+		Index:     index,
+		Name:      name,
+		Input:     input,
+		Count:     1,
+		TitleOnly: titleOnly,
+	})
 }
 
 // buildCardContent constructs the full markdown for the streaming card.
@@ -4477,6 +4610,18 @@ func buildCardContent(thinking string, tools []cardToolEntry, answer string) str
 		sb.WriteString("\n\n---\n\n")
 	}
 	for _, t := range tools {
+		if t.TitleOnly {
+			count := t.Count
+			if count < 1 {
+				count = 1
+			}
+			if count > 1 {
+				sb.WriteString(fmt.Sprintf("🔧 `%s ×%d`\n\n", t.Name, count))
+			} else {
+				sb.WriteString(fmt.Sprintf("🔧 `%s`\n\n", t.Name))
+			}
+			continue
+		}
 		sb.WriteString(fmt.Sprintf("🔧 **Tool #%d**: `%s`\n", t.Index, t.Name))
 		if t.Input != "" {
 			sb.WriteString(t.Input)
@@ -5178,28 +5323,30 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			if e.display.ToolMessages {
 				// --- StreamingCard path ---
 				if streamCard != nil && !streamCard.Failed() {
-					toolInput := event.ToolInput
+					titleOnly := e.toolTitleEnabledFor(p)
 					var formattedInput string
-					if toolInput == "" {
-						formattedInput = ""
-					} else if strings.Contains(toolInput, "```") {
-						formattedInput = toolInput
-					} else if strings.Contains(toolInput, "\n") || utf8.RuneCountInString(toolInput) > 200 {
-						lang := toolCodeLang(event.ToolName, toolInput)
-						formattedInput = fmt.Sprintf("```%s\n%s\n```", lang, toolInput)
-					} else {
-						switch event.ToolName {
-						case "shell", "run_shell_command", "Bash":
-							formattedInput = fmt.Sprintf("```bash\n%s\n```", toolInput)
-						default:
-							formattedInput = fmt.Sprintf("`%s`", toolInput)
+					if !titleOnly {
+						// Input detail is only rendered when title-only mode is off
+						// (decision: hide input unconditionally whenever the toggle
+						// is on, not just on rows that actually merged).
+						toolInput := event.ToolInput
+						if toolInput == "" {
+							formattedInput = ""
+						} else if strings.Contains(toolInput, "```") {
+							formattedInput = toolInput
+						} else if strings.Contains(toolInput, "\n") || utf8.RuneCountInString(toolInput) > 200 {
+							lang := toolCodeLang(event.ToolName, toolInput)
+							formattedInput = fmt.Sprintf("```%s\n%s\n```", lang, toolInput)
+						} else {
+							switch event.ToolName {
+							case "shell", "run_shell_command", "Bash":
+								formattedInput = fmt.Sprintf("```bash\n%s\n```", toolInput)
+							default:
+								formattedInput = fmt.Sprintf("`%s`", toolInput)
+							}
 						}
 					}
-					cardToolCalls = append(cardToolCalls, cardToolEntry{
-						Index: toolCount,
-						Name:  event.ToolName,
-						Input: formattedInput,
-					})
+					cardToolCalls = appendCardToolEntry(cardToolCalls, toolCount, event.ToolName, formattedInput, titleOnly)
 					_ = streamCard.Update(e.ctx, buildCardContent(cardThinkingText, cardToolCalls, cardAnswerText.String()))
 					continue // skip original independent message sending
 				}
@@ -5277,6 +5424,16 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 						}
 						break
 					}
+					// --- StreamingCard path ---
+					// The result is absorbed into the card the EventToolUse branch
+					// already rendered; cardToolEntry has no Result field (even in
+					// legacy Tool #N rendering, results were never shown in the
+					// card), so this is a pure no-op — no mutation, no re-render —
+					// rather than the standalone message the fallback below would
+					// otherwise send via e.sendRaw.
+					if streamCard != nil && !streamCard.Failed() {
+						continue
+					}
 					resultMsg := e.formatToolResultEventFallback(event.ToolName, result, event.ToolStatus, event.ToolExitCode, event.ToolSuccess)
 					entry := ProgressCardEntry{
 						Kind:     ProgressEntryToolResult,
@@ -5316,6 +5473,17 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				if streamCard != nil && !streamCard.Failed() {
 					textParts = append(textParts, content) // always accumulate for history
 					if !silentHold {
+						// Transient tool titles (mirrors the rich-card path's
+						// partialText == "" check below, decision #4): the moment
+						// VISIBLE body text starts THIS TURN, collapse the
+						// tool-title area. cardAnswerText.Len() == 0 is the
+						// once-per-turn "haven't written body text yet" signal —
+						// gated on !silentHold so a silent NO_REPLY prefix never
+						// wipes the tool rows. Subsequent tool calls re-accumulate
+						// a fresh area (appendCardToolEntry starts a new entry).
+						if e.toolTitleEnabledFor(p) && cardAnswerText.Len() == 0 && len(cardToolCalls) > 0 {
+							cardToolCalls = nil
+						}
 						if releasedNow {
 							cardAnswerText.WriteString(peekSegment)
 						} else {
@@ -5734,7 +5902,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				if isSilent {
 					cardBody = strings.TrimRight(cardAnswerText.String(), " \t\r\n")
 				}
-				finalContent := buildCardContent(cardThinkingText, cardToolCalls, cardBody)
+				finalContent := buildCardContent(cardThinkingText, e.finalCardToolCalls(p, cardToolCalls), cardBody)
 				if err := streamCard.Finalize(e.ctx, finalContent); err != nil {
 					slog.Error("streaming card finalize failed, sending fallback", "error", err)
 					// Fallback: send the response as a normal message — but never

@@ -1,6 +1,9 @@
 package core
 
-import "strings"
+import (
+	"path/filepath"
+	"strings"
+)
 
 // SessionScope describes the chat/user isolation coordinates of a single
 // conversation. It is derived from a session key (see ScopeFromSessionKey) and
@@ -54,4 +57,30 @@ func applySessionScope(as AgentSession, sessionKey string) {
 	if sc, ok := as.(ScopedSession); ok {
 		sc.SetScope(ScopeFromSessionKey(sessionKey))
 	}
+}
+
+// ScopedAttachmentsDir returns the on-disk directory where user-supplied input
+// attachments for a given chat are stored:
+//
+//	<workDir>/Chat/<chatID>/Inputs
+//
+// chatID is sanitized to a single safe path segment. This is THE canonical
+// computation — both the agent read path (claudeSession.attachmentsRoot) and
+// the engine's silent-archive write path (Message.SaveOnly → archiveAttachments)
+// call this function, guaranteeing a file archived without an agent turn lands
+// in the exact directory a later @bot turn reads from.
+func ScopedAttachmentsDir(workDir, chatID string) string {
+	return filepath.Join(workDir, "Chat", sanitizePathSegment(chatID), "Inputs")
+}
+
+// sanitizePathSegment reduces an untrusted identifier (e.g. a platform chat ID)
+// to a single safe path segment: path separators and traversal are stripped,
+// and any leftover empty/dotted result falls back to a stable placeholder so
+// callers never join "" or "..".
+func sanitizePathSegment(s string) string {
+	s = filepath.Base(strings.TrimSpace(s))
+	if s == "" || s == "." || s == ".." || s == string(filepath.Separator) {
+		return "_"
+	}
+	return s
 }
