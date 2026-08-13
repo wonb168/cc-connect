@@ -35,7 +35,7 @@ func TestRecordUsage_PostsRecord(t *testing.T) {
 		CacheReadInputTokens:     7,
 		CostUSD:                  0.42,
 	}
-	e.recordUsage("feishu:chatABC:ou_sender123", "claude-opus-4-8[1m]", nil, ev, &ContextUsage{ContextWindow: 1000, UsedTokens: 50}, 3*time.Second, time.UnixMilli(1700000000000))
+	e.recordUsage("feishu:chatABC:ou_sender123", "claude-opus-4-8[1m]", "agent-sess-xyz", nil, ev, &ContextUsage{ContextWindow: 1000, UsedTokens: 50}, 3*time.Second, time.UnixMilli(1700000000000))
 
 	// recordUsage posts asynchronously; wait for the request to land.
 	deadline := time.Now().Add(2 * time.Second)
@@ -75,12 +75,15 @@ func TestRecordUsage_PostsRecord(t *testing.T) {
 	if got.OutputTokens != 20 || got.InputTokens != 10 || got.CacheCreationInputTokens != 5 || got.CacheReadInputTokens != 7 {
 		t.Errorf("token counts mismatch: %+v", got)
 	}
+	if got.AgentSessionID != "agent-sess-xyz" {
+		t.Errorf("AgentSessionID = %q, want agent-sess-xyz", got.AgentSessionID)
+	}
 }
 
 func TestRecordUsage_DisabledWhenNoEndpoint(t *testing.T) {
 	e := &Engine{} // no endpoint
 	// Must not panic and must be a no-op.
-	e.recordUsage("feishu:c:u", "m", nil, Event{CostUSD: 1}, nil, 0, time.Now())
+	e.recordUsage("feishu:c:u", "m", "agent-sess-1", nil, Event{CostUSD: 1}, nil, 0, time.Now())
 }
 
 // TestRecordUsage_PrefersUnionIDOverSessionKeySender verifies that when the
@@ -106,7 +109,7 @@ func TestRecordUsage_PrefersUnionIDOverSessionKeySender(t *testing.T) {
 	sessions := NewSessionManager("")
 	sessions.UpdateUserMeta("feishu:chatABC:ou_sender123", "Zhang San", "", "on_union_abc")
 
-	e.recordUsage("feishu:chatABC:ou_sender123", "claude-opus-4-8[1m]", sessions, Event{CostUSD: 0.1}, nil, 0, time.Now())
+	e.recordUsage("feishu:chatABC:ou_sender123", "claude-opus-4-8[1m]", "agent-sess-xyz", sessions, Event{CostUSD: 0.1}, nil, 0, time.Now())
 
 	deadline := time.Now().Add(2 * time.Second)
 	for {

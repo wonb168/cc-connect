@@ -22,6 +22,7 @@ type UsageRecord struct {
 	Platform                 string  `json:"platform"`
 	SenderID                 string  `json:"sender_id"`
 	SessionKey               string  `json:"session_key"`
+	AgentSessionID           string  `json:"agent_session_id,omitempty"`
 	UserName                 string  `json:"user_name,omitempty"`
 	Agent                    string  `json:"agent"`
 	Model                    string  `json:"model"`
@@ -45,7 +46,13 @@ func (e *Engine) SetUsageRecorderEndpoint(endpoint string) {
 // to the configured recorder endpoint. Safe to call unconditionally: it returns
 // immediately when recording is disabled. Never blocks the caller (spawns a
 // goroutine with its own short timeout).
-func (e *Engine) recordUsage(sessionKey, model string, sessions *SessionManager, ev Event, usage *ContextUsage, turnDuration time.Duration, ts time.Time) {
+//
+// agentSessionID is the underlying CLI's session ID (e.g. claudecode's
+// --resume UUID), not cc-connect's own Session.ID. It changes on /new (cleared,
+// then repopulated once the fresh agent session replies) while sessionKey stays
+// stable across /new — so it's the field that lets a recorder distinguish
+// per-conversation segments within the same platform:chat:user.
+func (e *Engine) recordUsage(sessionKey, model, agentSessionID string, sessions *SessionManager, ev Event, usage *ContextUsage, turnDuration time.Duration, ts time.Time) {
 	endpoint := e.usageRecorderEndpoint
 	if endpoint == "" {
 		return
@@ -80,6 +87,7 @@ func (e *Engine) recordUsage(sessionKey, model string, sessions *SessionManager,
 		Platform:                 platform,
 		SenderID:                 senderID,
 		SessionKey:               sessionKey,
+		AgentSessionID:           agentSessionID,
 		UserName:                 userName,
 		Agent:                    e.name,
 		Model:                    model,

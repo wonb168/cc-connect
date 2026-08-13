@@ -5875,8 +5875,10 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 
 			// Best-effort, non-blocking usage/cost record to the external
 			// recorder (no-op when unconfigured). Uses sessionKey for stable
-			// platform+sender identity (Q7甲).
-			e.recordUsage(sessionKey, replyFooterModel(state.agentSession, replyAgent), sessions, event, replyFooterSessionContextUsage(state.agentSession), turnDuration, time.Now())
+			// platform+sender identity (Q7甲); AgentSessionID (already
+			// refreshed above for this turn) additionally distinguishes
+			// conversation segments across /new within the same sessionKey.
+			e.recordUsage(sessionKey, replyFooterModel(state.agentSession, replyAgent), session.GetAgentSessionID(), sessions, event, replyFooterSessionContextUsage(state.agentSession), turnDuration, time.Now())
 
 			e.noteUserTurnCompleted(state)
 
