@@ -184,6 +184,10 @@ func New(opts map[string]any) (core.Platform, error) {
 
 func (p *Platform) Name() string { return "qqbot" }
 
+// AppID returns the QQ Bot app_id this platform instance authenticates as.
+// Implements core.AppIDProvider for the usage recorder.
+func (p *Platform) AppID() string { return p.appID }
+
 // Start connects to the QQ Bot gateway and begins receiving events.
 func (p *Platform) Start(handler core.MessageHandler) error {
 	p.handler = handler

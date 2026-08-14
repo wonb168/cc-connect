@@ -184,6 +184,10 @@ func New(opts map[string]any) (core.Platform, error) {
 
 func (p *Platform) Name() string { return "wps-xiezuo" }
 
+// AppID returns the app_id this platform instance authenticates as.
+// Implements core.AppIDProvider for the usage recorder.
+func (p *Platform) AppID() string { return p.appID }
+
 // Start begins the WebSocket connection loop.
 func (p *Platform) Start(handler core.MessageHandler) error {
 	p.handler = handler

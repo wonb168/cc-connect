@@ -200,6 +200,12 @@ func New(opts map[string]any) (core.Platform, error) {
 
 func (p *Platform) Name() string { return "wecom" }
 
+// AppID returns the corp_id:agent_id pair identifying this self-built WeCom
+// app — a corp can host multiple self-built apps under distinct agent_ids,
+// so corp_id alone is not unique. Implements core.AppIDProvider for the
+// usage recorder.
+func (p *Platform) AppID() string { return p.corpID + ":" + p.agentID }
+
 func (p *Platform) wecomAPIURL(path string, query url.Values) string {
 	base := strings.TrimRight(strings.TrimSpace(p.apiBaseURL), "/")
 	if base == "" {

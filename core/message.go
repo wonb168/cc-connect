@@ -443,7 +443,8 @@ type Event struct {
 	OutputTokens             int
 	CacheCreationInputTokens int            // cache-write tokens (new content written to cache)
 	CacheReadInputTokens     int            // cache-read tokens (prior context retrieved from cache)
-	CostUSD                  float64        // total_cost_usd for the turn (authoritative CLI billing figure); 0 = unknown
+	CostUSD                  float64        // cost of this turn alone (delta of the CLI's cumulative total_cost_usd); 0 = unknown
+	SessionCostUSD           float64        // CLI's cumulative total_cost_usd for the session as of this event; 0 = unknown
 	Metadata                 map[string]any // optional metadata from agent (e.g. compaction_continue)
 	Synthetic                bool           // true if this is a synthetic/generated message (not from real user)
 }

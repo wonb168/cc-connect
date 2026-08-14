@@ -5878,7 +5878,10 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			// platform+sender identity (Q7甲); AgentSessionID (already
 			// refreshed above for this turn) additionally distinguishes
 			// conversation segments across /new within the same sessionKey.
-			e.recordUsage(sessionKey, replyFooterModel(state.agentSession, replyAgent), session.GetAgentSessionID(), sessions, event, replyFooterSessionContextUsage(state.agentSession), turnDuration, time.Now())
+			// state.platform additionally carries AppID (when the platform
+			// implements AppIDProvider) so a recorder can distinguish
+			// multiple bots of the same platform type.
+			e.recordUsage(sessionKey, replyFooterModel(state.agentSession, replyAgent), session.GetAgentSessionID(), state.platform, sessions, event, replyFooterSessionContextUsage(state.agentSession), turnDuration, time.Now())
 
 			e.noteUserTurnCompleted(state)
 
@@ -7423,13 +7426,14 @@ func (e *Engine) composeRichStatusFooter(streaming bool, turnStart time.Time, ag
 	model := replyFooterModel(session, agent)
 	effort := replyFooterReasoningEffort(session, agent)
 	costUSD := replyFooterSessionCostUSD(session)
-	costSeg := formatCostSegment(costUSD, e.pointRatio, e.i18n)
+	sessionCostUSD := replyFooterTotalCostUSD(session)
+	costSeg := formatCostSegment(costUSD, sessionCostUSD, e.pointRatio, e.i18n)
 
 	// Template override: when a footer template is configured, it fully
 	// replaces the built-in layout. Missing placeholders render empty.
 	if e.replyFooterTemplate != "" {
 		return renderFooterTemplate(e.replyFooterTemplate, e.footerTemplateVars(
-			elapsed, model, effort, costUSD, costSeg, usage, session, agent, workspaceDir))
+			elapsed, model, effort, costUSD, sessionCostUSD, costSeg, usage, session, agent, workspaceDir))
 	}
 
 	var lines []string
@@ -7705,6 +7709,20 @@ func replyFooterSessionCostUSD(session AgentSession) float64 {
 	return reporter.GetLastCostUSD()
 }
 
+// replyFooterTotalCostUSD returns the session's cumulative cost in USD, or 0
+// when the session cannot report it. Callers treat 0 as "unknown" and fall back
+// to showing the per-turn figure alone.
+func replyFooterTotalCostUSD(session AgentSession) float64 {
+	if session == nil {
+		return 0
+	}
+	reporter, ok := session.(SessionCostReporter)
+	if !ok {
+		return 0
+	}
+	return reporter.GetSessionCostUSD()
+}
+
 // formatMoney renders a monetary/point value to at most 4 decimal places with
 // trailing zeros trimmed (e.g. 0.35406250000000006 → "0.3541", 5.0 → "5").
 // Rounding to 4 dp avoids leaking float64 representation noise into the footer.
@@ -7717,16 +7735,39 @@ func formatMoney(v float64) string {
 	return s
 }
 
-// formatCostSegment renders the footer cost segment "<point>点(<$cost>)" from a
-// USD cost and the display point ratio. Returns "" when cost is unknown (<=0).
-// Values are rounded to 4 decimals with trailing zeros trimmed.
-func formatCostSegment(costUSD, pointRatio float64, i18n *I18n) string {
-	if costUSD <= 0 {
+// formatCostSegment renders the footer cost segment from this turn's USD cost,
+// the session's cumulative USD cost and the display point ratio:
+//
+//	turn only (session total unknown):  "0.35点($0.35)"
+//	turn + session total:               "0.35点($0.35) / 共 1.2点($1.2)"
+//
+// turnCostUSD is the cost of the turn just completed; sessionCostUSD is what the
+// session has cost so far. The session total is appended only when it is known
+// and actually exceeds the turn cost — on the first turn of a session the two
+// are equal and repeating the number would be noise. Returns "" when the turn
+// cost is unknown (<=0). Values are rounded to 4 decimals with trailing zeros
+// trimmed.
+func formatCostSegment(turnCostUSD, sessionCostUSD, pointRatio float64, i18n *I18n) string {
+	if turnCostUSD <= 0 {
 		return ""
 	}
 	if pointRatio <= 0 {
 		pointRatio = 1
 	}
+	seg := formatCostPair(turnCostUSD, pointRatio, i18n)
+	if sessionCostUSD > turnCostUSD {
+		total := formatCostPair(sessionCostUSD, pointRatio, i18n)
+		if i18n != nil {
+			return seg + " / " + i18n.Tf(MsgReplyFooterCostSessionTotal, total)
+		}
+		return seg + " / 共 " + total
+	}
+	return seg
+}
+
+// formatCostPair renders one "<point>点(<$cost>)" figure — the shared shape of
+// both the per-turn and session-total halves of the cost segment.
+func formatCostPair(costUSD, pointRatio float64, i18n *I18n) string {
 	pointStr := formatMoney(costUSD * pointRatio)
 	costStr := formatMoney(costUSD)
 	if i18n != nil {
@@ -7737,8 +7778,10 @@ func formatCostSegment(costUSD, pointRatio float64, i18n *I18n) string {
 
 // renderFooterTemplate performs plain placeholder substitution on a footer
 // template. Missing values render as empty string (Q11: simplest behavior).
-// Recognised placeholders: {ctx} {point} {cost_usd} {elapsed} {model}
-// {effort} {tokens} {workdir}.
+// Recognised placeholders: {ctx} {point} {cost_usd} {session_point}
+// {session_cost_usd} {elapsed} {model} {effort} {tokens} {workdir}.
+// {point}/{cost_usd} are this turn alone; the {session_*} pair is the
+// session running total.
 func renderFooterTemplate(tmpl string, vars map[string]string) string {
 	out := tmpl
 	for k, v := range vars {
@@ -7749,24 +7792,30 @@ func renderFooterTemplate(tmpl string, vars map[string]string) string {
 
 // footerTemplateVars builds the placeholder map for renderFooterTemplate.
 // Values that are unknown/missing map to "" so they disappear from the output.
-func (e *Engine) footerTemplateVars(elapsed, model, effort string, costUSD float64, costSeg string, usage *ContextUsage, session AgentSession, agent Agent, workspaceDir string) map[string]string {
+func (e *Engine) footerTemplateVars(elapsed, model, effort string, costUSD, sessionCostUSD float64, costSeg string, usage *ContextUsage, session AgentSession, agent Agent, workspaceDir string) map[string]string {
 	vars := map[string]string{
-		"elapsed":  strings.TrimSpace(strings.TrimPrefix(elapsed, "⏱")),
-		"model":    model,
-		"effort":   effort,
-		"cost_usd": "",
-		"point":    "",
-		"ctx":      "",
-		"tokens":   "",
-		"workdir":  replyFooterWorkDir(session, agent, workspaceDir),
+		"elapsed":          strings.TrimSpace(strings.TrimPrefix(elapsed, "⏱")),
+		"model":            model,
+		"effort":           effort,
+		"cost_usd":         "",
+		"point":            "",
+		"session_cost_usd": "",
+		"session_point":    "",
+		"ctx":              "",
+		"tokens":           "",
+		"workdir":          replyFooterWorkDir(session, agent, workspaceDir),
+	}
+	ratio := e.pointRatio
+	if ratio <= 0 {
+		ratio = 1
 	}
 	if costUSD > 0 {
-		ratio := e.pointRatio
-		if ratio <= 0 {
-			ratio = 1
-		}
 		vars["cost_usd"] = formatMoney(costUSD)
 		vars["point"] = formatMoney(costUSD * ratio)
+	}
+	if sessionCostUSD > 0 {
+		vars["session_cost_usd"] = formatMoney(sessionCostUSD)
+		vars["session_point"] = formatMoney(sessionCostUSD * ratio)
 	}
 	if usage != nil && usage.ContextWindow > 0 {
 		used := usage.UsedTokens

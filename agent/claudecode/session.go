@@ -60,11 +60,20 @@ type claudeSession struct {
 	// configured model.
 	activeModel atomic.Value // stores string
 
-	// usageMu guards lastUsage and lastCostUSD. Populated from the most
-	// recent result event.
-	usageMu     sync.Mutex
-	lastUsage   *core.ContextUsage
-	lastCostUSD float64 // total_cost_usd from the most recent turn result; 0 = unknown
+	// usageMu guards lastUsage, sessionCostUSD, lastTurnCostUSD and
+	// costBaselineUSD. Populated from the most recent result event.
+	usageMu   sync.Mutex
+	lastUsage *core.ContextUsage
+	// sessionCostUSD is the CLI's total_cost_usd as last reported: a
+	// running total for the whole CLI session, NOT the cost of one turn.
+	// 0 = unknown.
+	sessionCostUSD float64
+	// lastTurnCostUSD is the cost attributable to the most recent completed
+	// turn — the rise in sessionCostUSD across that turn. 0 = unknown.
+	lastTurnCostUSD float64
+	// costBaselineUSD is sessionCostUSD as of the end of the previous turn,
+	// i.e. the value the next turn's delta is measured from.
+	costBaselineUSD float64
 
 	// gracefulStopTimeout is how long Close() waits for a clean exit
 	// (stdin close → Stop hooks → process exit) before escalating to
@@ -1006,28 +1015,44 @@ func (cs *claudeSession) handleResult(raw map[string]any) {
 		inputTokens, outputTokens, cacheCreationTokens, cacheReadTokens = parseClaudeUsage(usage)
 	}
 
-	// total_cost_usd is the CLI's authoritative per-turn billing figure
-	// (already accounts for cache-write / cache-read price tiers). It is the
-	// single source of truth for cost, used both for the reply footer and for
-	// usage recording. A missing/zero value means "cost unknown" (e.g. a
-	// relay provider that does not report billing) — we never estimate it from
-	// token counts.
-	var costUSD float64
+	// total_cost_usd is the CLI's authoritative billing figure (already accounts
+	// for cache-write / cache-read price tiers), and it is CUMULATIVE for the
+	// whole CLI session — each result event reports the running total, not the
+	// cost of that turn alone. The per-turn figure is therefore the rise since
+	// the previous completed turn (costBaselineUSD). Both are surfaced: the
+	// delta for "what did this turn cost", the total for "what has this session
+	// cost so far". A missing/zero value means "cost unknown" (e.g. a relay
+	// provider that does not report billing) — we never estimate it from token
+	// counts.
+	var sessionCostUSD float64
 	if v, ok := raw["total_cost_usd"].(float64); ok {
-		costUSD = v
+		sessionCostUSD = v
 	}
 
-	if outputTokens > 0 || costUSD > 0 {
-		cs.usageMu.Lock()
-		if outputTokens > 0 && cs.lastUsage != nil {
-			cs.lastUsage.OutputTokens = outputTokens
-			cs.lastUsage.TotalTokens = cs.lastUsage.UsedTokens + outputTokens
-		}
-		if costUSD > 0 {
-			cs.lastCostUSD = costUSD
-		}
-		cs.usageMu.Unlock()
+	var turnCostUSD float64
+	cs.usageMu.Lock()
+	if outputTokens > 0 && cs.lastUsage != nil {
+		cs.lastUsage.OutputTokens = outputTokens
+		cs.lastUsage.TotalTokens = cs.lastUsage.UsedTokens + outputTokens
 	}
+	if sessionCostUSD > 0 {
+		cs.sessionCostUSD = sessionCostUSD
+		// A total below the baseline means the CLI restarted its counter
+		// (e.g. --resume into a fresh process); treat the reported total as
+		// the turn's own cost and re-baseline rather than emitting a negative.
+		if sessionCostUSD >= cs.costBaselineUSD {
+			turnCostUSD = sessionCostUSD - cs.costBaselineUSD
+		} else {
+			turnCostUSD = sessionCostUSD
+		}
+		if !isCompaction {
+			// Only a completed turn advances the baseline. A mid-turn
+			// compaction's cost stays inside the turn that triggered it.
+			cs.costBaselineUSD = sessionCostUSD
+			cs.lastTurnCostUSD = turnCostUSD
+		}
+	}
+	cs.usageMu.Unlock()
 
 	evt := core.Event{
 		Type:                     core.EventResult,
@@ -1038,7 +1063,8 @@ func (cs *claudeSession) handleResult(raw map[string]any) {
 		OutputTokens:             outputTokens,
 		CacheCreationInputTokens: cacheCreationTokens,
 		CacheReadInputTokens:     cacheReadTokens,
-		CostUSD:                  costUSD,
+		CostUSD:                  turnCostUSD,
+		SessionCostUSD:           sessionCostUSD,
 	}
 	select {
 	case cs.events <- evt:
@@ -1358,12 +1384,26 @@ func (cs *claudeSession) GetContextUsage() *core.ContextUsage {
 	return &clone
 }
 
-// GetLastCostUSD returns the total_cost_usd from the most recent turn result,
-// or 0 if unknown / not yet observed. Implements core.CostReporter.
+// GetLastCostUSD returns the cost of the most recent completed turn — the rise
+// in the CLI's cumulative total_cost_usd across that turn — or 0 if unknown /
+// not yet observed. Implements core.CostReporter.
 func (cs *claudeSession) GetLastCostUSD() float64 {
 	cs.usageMu.Lock()
 	defer cs.usageMu.Unlock()
-	return cs.lastCostUSD
+	return cs.lastTurnCostUSD
+}
+
+// GetSessionCostUSD returns the CLI's cumulative total_cost_usd for this
+// session as of the most recent result event, or 0 if unknown / not yet
+// observed. Implements core.SessionCostReporter.
+//
+// Note this counter belongs to the CLI process: resuming a conversation in a
+// fresh process restarts it, so it is "cost since this process attached to the
+// conversation", not the conversation's all-time cost.
+func (cs *claudeSession) GetSessionCostUSD() float64 {
+	cs.usageMu.Lock()
+	defer cs.usageMu.Unlock()
+	return cs.sessionCostUSD
 }
 
 func (cs *claudeSession) Alive() bool {

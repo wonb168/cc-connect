@@ -140,6 +140,10 @@ func (p *WSPlatform) generateReqID(prefix string) string {
 
 func (p *WSPlatform) Name() string { return "wecom" }
 
+// AppID returns the bot_id this AI-bot WebSocket connection authenticates
+// as. Implements core.AppIDProvider for the usage recorder.
+func (p *WSPlatform) AppID() string { return p.botID }
+
 func (p *WSPlatform) Start(handler core.MessageHandler) error {
 	p.handler = handler
 	p.ctx, p.cancel = context.WithCancel(context.Background())

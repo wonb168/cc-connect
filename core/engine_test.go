@@ -7165,6 +7165,7 @@ type controllableAgentSession struct {
 	contextUsage    *ContextUsage
 	usageErr        error
 	costUSD         float64
+	sessionCostUSD  float64
 }
 
 func newControllableSession(id string) *controllableAgentSession {
@@ -7193,6 +7194,7 @@ func (s *controllableAgentSession) GetUsage(_ context.Context) (*UsageReport, er
 }
 func (s *controllableAgentSession) GetContextUsage() *ContextUsage { return s.contextUsage }
 func (s *controllableAgentSession) GetLastCostUSD() float64        { return s.costUSD }
+func (s *controllableAgentSession) GetSessionCostUSD() float64     { return s.sessionCostUSD }
 func (s *controllableAgentSession) Alive() bool                    { return s.alive }
 func (s *controllableAgentSession) Close() error {
 	s.alive = false

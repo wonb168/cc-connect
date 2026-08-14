@@ -93,6 +93,12 @@ func New(opts map[string]any) (core.Platform, error) {
 
 func (p *Platform) Name() string { return "yuanbao" }
 
+// AppID returns the app_key this platform instance authenticates as (set
+// once at construction, unlike botID which is only known after the first
+// successful token exchange). Implements core.AppIDProvider for the usage
+// recorder.
+func (p *Platform) AppID() string { return p.appKey }
+
 // splitBotToken splits a "app_key:app_secret" string. An empty input yields
 // empty outputs so callers can detect the missing-config case with a simple
 // `appKey == "" || appSecret == ""` check.

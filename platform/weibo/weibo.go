@@ -102,6 +102,10 @@ func New(opts map[string]any) (core.Platform, error) {
 
 func (p *Platform) Name() string { return p.name }
 
+// AppID returns the Weibo app_id this platform instance authenticates as.
+// Implements core.AppIDProvider for the usage recorder.
+func (p *Platform) AppID() string { return p.appID }
+
 func (p *Platform) Start(handler core.MessageHandler) error {
 	p.handler = handler
 	p.ctx, p.cancel = context.WithCancel(context.Background())

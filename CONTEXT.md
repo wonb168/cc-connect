@@ -38,7 +38,16 @@ Claude Code CLI 在上下文接近窗口上限时,对历史消息做的一次自
 飞书等平台在每轮 Agent 回复**末尾**渲染的一到多段状态信息。当前已有字段:耗时(⏱)、model·effort·token 明细(out/in/cw/cr)·上下文占用百分比(ctx%)、工作目录。本次需求新增:**消耗金额([[cost]])**,并使显示形式**可配置**。
 
 ### Cost(消耗金额)
-单轮回复的美元成本,口径**统一采用** Claude Code CLI result 事件里的 `total_cost_usd` 字段(官方账单口径,已含各类缓存折价)。**不**自行按 token 单价计算。此口径同时用于 [[reply-footer]] 展示与 [[usage-recorder]] 入库,二者必须一致。若走非官方计费的中转 provider 导致该字段为 0/缺失,则视为成本未知(不兜底计算)。
+美元成本口径**统一采用** Claude Code CLI result 事件里的 `total_cost_usd` 字段(官方账单口径,已含各类缓存折价)。**不**自行按 token 单价计算。若走非官方计费的中转 provider 导致该字段为 0/缺失,则视为成本未知(不兜底计算)。
+
+**关键:`total_cost_usd` 是会话累计值,不是单轮值。** 同一会话内它逐轮递增(已对 turns 表实测验证:0.306→0.474→0.544→1.002 单调不降),因此:
+
+- **单轮成本** = 本轮 `total_cost_usd` − 上一轮结束时的值(差值),由 `claudeSession` 维护 baseline 计算。
+- **会话累计** = `total_cost_usd` 原值。
+- 该计数器属于 **CLI 进程**:同一对话用 `--resume` 在新进程中续接时计数器会重新从 0 开始(已实测)。故差值计算须防御"低于 baseline"的回退情形,回退时以当前值作为本轮成本并重设 baseline。
+- 轮次中途的 compact 事件**不**推进 baseline,其成本归属于触发它的那一轮。
+
+[[reply-footer]] 两者并列展示;[[usage-recorder]] 两者都入库(`turn_cost_usd` = 单轮,`cost_usd` = 累计,后者维持历史语义不变)。**统计一段时间的消费应 SUM `turn_cost_usd`,SUM `cost_usd` 会重复计数。**
 
 相关:[[reply-footer]]、[[usage-recorder]]、[[point]]
 
@@ -46,8 +55,10 @@ Claude Code CLI 在上下文接近窗口上限时,对历史消息做的一次自
 [[reply-footer]] 中用于展示成本的**显示单位**。由 `total_cost_usd`(美金)乘以一个**可配置比例系数**换算得到(当前默认比例 = 1,即 1 点 = 1 美金)。
 
 - `点`只是美金符号的一层**展示皮肤**,**仅作用于 footer 渲染**。
-- [[usage-recorder]] 入库的永远是原始美金 `total_cost_usd`,**不受**比例系数影响;要点数在查询层再乘比例。
+- [[usage-recorder]] 入库的永远是原始美金值,**不受**比例系数影响;要点数在查询层再乘比例。
 - footer 示例 `上下文x%-y点(消耗金额)-z秒` 中:`y点`=换算后点数,`(消耗金额)`=原始美金值,二者并列。
+- footer 同时展示**本轮**与**会话累计**两个金额,形如 `0.25 点 ($0.25) / 共 1.5 点 ($1.5)`;会话首轮二者相等时省略累计部分,避免重复。
+- 自定义 footer 模板占位符:`{point}`/`{cost_usd}` 为**本轮**,`{session_point}`/`{session_cost_usd}` 为**会话累计**。
 
 相关:[[cost]]、[[reply-footer]]
 
@@ -69,7 +80,15 @@ Claude Code CLI 在上下文接近窗口上限时,对历史消息做的一次自
 - 落点:`core/engine.go` 的 `EventToolUse` 分支(追加时做同名合并计数)+ 卡片渲染时依"是否已有正文 / 是否定稿"决定 `toolSteps` 是否传空;`ToolStep` 结构需增计数字段。
 
 ### Usage Recorder(用量入库模块)
-[[compact-orchestrator]] 所在伴生微服务的第二个模块。接收 cc-connect core 每轮回复结束时的**出站 POST**({提问人身份, model, token 四元组, [[cost]]}),写入 PostgreSQL。是否启用、pg 连接、表结构均可配置。提问人身份来自 cc-connect(平台侧 sender),CLI hook 无法提供,故此模块的数据来源必须是 core 出站钩子而非 CLI hook。
+[[compact-orchestrator]] 所在伴生微服务的第二个模块。接收 cc-connect core 每轮回复结束时的**出站 POST**({提问人身份, [[app-id]], model, token 四元组, [[cost]]}),写入 PostgreSQL。是否启用、pg 连接、表结构均可配置。提问人身份来自 cc-connect(平台侧 sender),CLI hook 无法提供,故此模块的数据来源必须是 core 出站钩子而非 CLI hook。
+
+`turns` 表的列由伴生服务启动时的 `ensureSchema` **仅增量补齐**(`ADD COLUMN IF NOT EXISTS`,幂等):表归属另一系统,绝不 CREATE/DROP/RENAME/改类型。
+
+- `app_id`:`text NOT NULL DEFAULT ''`,沿用表内身份列惯例,历史行读出为 `''`。
+- `turn_cost_usd`:`real` **可空**。NULL 表示"该行早于单轮成本统计",与真实的 0.00 语义不同。历史行不回填——旧的 `cost_usd` 存的是会话累计值,无法还原出单轮值,回填只会写入错误数字。
+
+### App ID(应用标识)
+平台侧 app/bot/client 注册 ID(飞书 `app_id`、钉钉 `client_id`、企微 `corp_id`)。用于区分同一 platform 类型下写入同一张表的**多个机器人**。平台实现 `core.AppIDProvider` 即可携带;无此概念的平台(如经本地中继的 QQ OneBot)不实现,入库为空串。
 
 ## 隔离与会话记录模型
 

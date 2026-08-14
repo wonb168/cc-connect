@@ -136,9 +136,12 @@ level = "info" # debug, info, warn, error
 #                                      # (e.g. ["dingtalk"] to keep Feishu's rich-card merging but disable it there); default: none excluded
 #                                      # 关闭 tool_title 在指定平台(DingTalk/Slack 流式卡片路径)的瞬态合并行为,如 ["dingtalk"];默认不排除任何平台
 # reply_footer_template = ""     # Override the rich-card footer layout. Non-empty replaces the built-in layout.
-#                                # Placeholders (missing values render empty): {ctx} {point} {cost_usd} {elapsed} {model} {effort} {tokens} {workdir}
+#                                # Placeholders (missing values render empty): {ctx} {point} {cost_usd} {session_point}
+#                                #   {session_cost_usd} {elapsed} {model} {effort} {tokens} {workdir}
+#                                # {point}/{cost_usd} are THIS TURN alone; {session_point}/{session_cost_usd} are the session running total.
 #                                # 自定义状态行模板,非空则完全覆盖默认布局;占位符缺值渲染为空串
-#                                # 例:reply_footer_template = "上下文{ctx}%-{point}点({cost_usd})-{elapsed}秒"
+#                                # {point}/{cost_usd} 为本轮金额,{session_point}/{session_cost_usd} 为会话累计金额
+#                                # 例:reply_footer_template = "上下文{ctx}%-本轮{point}点({cost_usd})-累计{session_point}点-{elapsed}秒"
 # point_ratio = 1.0              # Display-only USD→point ratio for the footer cost segment ({point} = cost_usd * ratio; default 1)
 #                                # 仅影响 footer 展示的「点」换算比例(入库始终为美金原值;默认 1)
 

@@ -168,6 +168,10 @@ func New(opts map[string]any) (core.Platform, error) {
 
 func (p *Platform) Name() string { return "dingtalk" }
 
+// AppID returns the DingTalk client_id this platform instance authenticates
+// as. Implements core.AppIDProvider for the usage recorder.
+func (p *Platform) AppID() string { return p.clientID }
+
 func (p *Platform) Start(handler core.MessageHandler) error {
 	p.handler = handler
 

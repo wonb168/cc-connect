@@ -151,6 +151,13 @@ func New(opts map[string]any) (core.Platform, error) {
 
 func (p *Platform) Name() string { return "discord" }
 
+// AppID returns the Discord application ID this bot connected as. Populated
+// asynchronously from the gateway Ready event (see buildSession), so it may
+// be empty until the first connection completes — same lifecycle as botID,
+// read elsewhere in this file without extra locking. Implements
+// core.AppIDProvider for the usage recorder.
+func (p *Platform) AppID() string { return p.appID }
+
 func (p *Platform) selfPlatform() core.Platform {
 	if p != nil && p.self != nil {
 		return p.self

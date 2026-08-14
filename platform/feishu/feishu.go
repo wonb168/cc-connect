@@ -463,6 +463,10 @@ func newPlatform(name, domain string, opts map[string]any) (core.Platform, error
 
 func (p *Platform) Name() string { return p.platformName }
 
+// AppID returns the Feishu/Lark app_id this platform instance authenticates
+// as. Implements core.AppIDProvider for the usage recorder.
+func (p *Platform) AppID() string { return p.appID }
+
 func (p *Platform) ProgressStyle() string { return p.progressStyle }
 
 func (p *Platform) SupportsProgressCardPayload() bool { return true }

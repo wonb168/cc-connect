@@ -566,6 +566,15 @@ type CostReporter interface {
 	GetLastCostUSD() float64
 }
 
+// SessionCostReporter is an optional interface for running agent sessions that
+// can additionally report cumulative cost since the session started. The reply
+// footer shows it next to the per-turn figure so a user sees both "this turn"
+// and "this session so far". Sessions implementing only CostReporter have no
+// session total displayed.
+type SessionCostReporter interface {
+	GetSessionCostUSD() float64
+}
+
 // ContextUsage describes runtime context consumption for the active session.
 type ContextUsage struct {
 	// UsedTokens is the current token load to compare against ContextWindow when
@@ -705,6 +714,17 @@ type CommandRegistrar interface {
 // channel IDs to human-readable names.
 type ChannelNameResolver interface {
 	ResolveChannelName(channelID string) (string, error)
+}
+
+// AppIDProvider is an optional interface for platforms whose credentials are
+// scoped to a specific app/bot/client registration (e.g. Feishu app_id,
+// DingTalk client_id, WeCom corp_id+agent_id). The usage recorder uses this
+// to distinguish multiple bots of the same platform type recording into the
+// same downstream table. Platforms with no such registration concept (e.g.
+// QQ's OneBot bridge, which talks to a local relay rather than a registered
+// app) simply don't implement it.
+type AppIDProvider interface {
+	AppID() string
 }
 
 // StreamingCard represents an active streaming card that aggregates

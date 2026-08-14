@@ -79,8 +79,125 @@ func TestHandleResultParsesCost(t *testing.T) {
 	if evt.CostUSD != 0.0421 {
 		t.Errorf("CostUSD = %v, want 0.0421", evt.CostUSD)
 	}
+	if evt.SessionCostUSD != 0.0421 {
+		t.Errorf("SessionCostUSD = %v, want 0.0421", evt.SessionCostUSD)
+	}
 	if got := cs.GetLastCostUSD(); got != 0.0421 {
 		t.Errorf("GetLastCostUSD() = %v, want 0.0421", got)
+	}
+	if got := cs.GetSessionCostUSD(); got != 0.0421 {
+		t.Errorf("GetSessionCostUSD() = %v, want 0.0421", got)
+	}
+}
+
+// resultWithCost builds a minimal CLI result event carrying a cumulative
+// total_cost_usd, for exercising per-turn delta extraction.
+func resultWithCost(total float64) map[string]any {
+	return map[string]any{
+		"type":           "result",
+		"result":         "done",
+		"session_id":     "test-session",
+		"total_cost_usd": total,
+		"usage":          map[string]any{"output_tokens": float64(100)},
+	}
+}
+
+// TestHandleResultCostIsPerTurnDelta pins the core semantic: the CLI's
+// total_cost_usd is CUMULATIVE across the session, so each turn's own cost is
+// the rise since the previous turn. Reporting the raw total per turn is what
+// made the footer (and the turns table) show a session running total where a
+// per-turn charge was expected.
+func TestHandleResultCostIsPerTurnDelta(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cs := &claudeSession{events: make(chan core.Event, 8), ctx: ctx}
+	cs.sessionID.Store("test-session")
+	cs.alive.Store(true)
+
+	// Cumulative totals observed across three turns.
+	totals := []float64{0.30, 0.47, 0.55}
+	wantTurn := []float64{0.30, 0.17, 0.08}
+
+	for i, total := range totals {
+		cs.handleResult(resultWithCost(total))
+		evt := <-cs.events
+		if diff := evt.CostUSD - wantTurn[i]; diff > 1e-9 || diff < -1e-9 {
+			t.Errorf("turn %d: CostUSD = %v, want %v", i+1, evt.CostUSD, wantTurn[i])
+		}
+		if diff := evt.SessionCostUSD - total; diff > 1e-9 || diff < -1e-9 {
+			t.Errorf("turn %d: SessionCostUSD = %v, want %v", i+1, evt.SessionCostUSD, total)
+		}
+		if diff := cs.GetLastCostUSD() - wantTurn[i]; diff > 1e-9 || diff < -1e-9 {
+			t.Errorf("turn %d: GetLastCostUSD() = %v, want %v", i+1, cs.GetLastCostUSD(), wantTurn[i])
+		}
+		if diff := cs.GetSessionCostUSD() - total; diff > 1e-9 || diff < -1e-9 {
+			t.Errorf("turn %d: GetSessionCostUSD() = %v, want %v", i+1, cs.GetSessionCostUSD(), total)
+		}
+	}
+}
+
+// TestHandleResultCostCounterReset covers the CLI restarting its cumulative
+// counter mid-conversation (verified behaviour when a conversation is resumed
+// in a fresh process). The turn cost must never go negative; the reported
+// total is taken as the turn's own cost and becomes the new baseline.
+func TestHandleResultCostCounterReset(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cs := &claudeSession{events: make(chan core.Event, 8), ctx: ctx}
+	cs.sessionID.Store("test-session")
+	cs.alive.Store(true)
+
+	cs.handleResult(resultWithCost(0.80))
+	<-cs.events
+
+	// Counter restarts lower than the baseline.
+	cs.handleResult(resultWithCost(0.017))
+	evt := <-cs.events
+	if evt.CostUSD != 0.017 {
+		t.Errorf("after reset: CostUSD = %v, want 0.017", evt.CostUSD)
+	}
+
+	// The next turn measures from the post-reset baseline, not the old one.
+	cs.handleResult(resultWithCost(0.020))
+	evt = <-cs.events
+	if diff := evt.CostUSD - 0.003; diff > 1e-9 || diff < -1e-9 {
+		t.Errorf("after reset, next turn: CostUSD = %v, want 0.003", evt.CostUSD)
+	}
+}
+
+// TestHandleResultCompactionDoesNotAdvanceCostBaseline verifies that a mid-turn
+// compaction (a result event that is NOT turn completion) leaves the baseline
+// alone, so the compaction's cost stays attributed to the turn that triggered
+// it rather than being split into a phantom turn.
+func TestHandleResultCompactionDoesNotAdvanceCostBaseline(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cs := &claudeSession{events: make(chan core.Event, 8), ctx: ctx}
+	cs.sessionID.Store("test-session")
+	cs.alive.Store(true)
+
+	cs.handleResult(resultWithCost(0.10))
+	<-cs.events
+
+	compaction := resultWithCost(0.14)
+	compaction["subtype"] = "compact"
+	cs.handleResult(compaction)
+	evt := <-cs.events
+	if evt.Done {
+		t.Fatalf("compaction event should not be Done")
+	}
+	if got := cs.GetLastCostUSD(); got != 0.10 {
+		t.Errorf("compaction changed last turn cost: got %v, want 0.10 unchanged", got)
+	}
+
+	// Turn completes: its cost spans the compaction too (0.20 - 0.10).
+	cs.handleResult(resultWithCost(0.20))
+	evt = <-cs.events
+	if diff := evt.CostUSD - 0.10; diff > 1e-9 || diff < -1e-9 {
+		t.Errorf("turn spanning compaction: CostUSD = %v, want 0.10", evt.CostUSD)
 	}
 }
 

@@ -166,6 +166,10 @@ func New(opts map[string]any) (core.Platform, error) {
 
 func (p *Platform) Name() string { return "tuitui" }
 
+// AppID returns the app_id this platform instance authenticates as.
+// Implements core.AppIDProvider for the usage recorder.
+func (p *Platform) AppID() string { return p.appID }
+
 func (p *Platform) Start(handler core.MessageHandler) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()

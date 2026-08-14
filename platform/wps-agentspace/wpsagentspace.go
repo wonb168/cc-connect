@@ -168,6 +168,10 @@ func (p *Platform) Name() string {
 	return "wps-agentspace"
 }
 
+// AppID returns the app_id this platform instance authenticates as.
+// Implements core.AppIDProvider for the usage recorder.
+func (p *Platform) AppID() string { return p.appID }
+
 // Start initializes the WebSocket connection and begins message processing.
 func (p *Platform) Start(handler core.MessageHandler) error {
 	p.handler = handler
