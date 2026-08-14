@@ -791,6 +791,26 @@ func (sm *SessionManager) InvalidateForAgent(agentType string) {
 //   - "platform:chatID:userID" → baseChat="platform:chatID", userOrThread="userID"
 //   - "platform:chatID:root:rootID" → baseChat="platform:chatID", userOrThread="root:rootID"
 //   - "platform:chatID" → baseChat="platform:chatID", userOrThread=""
+//   - "platform:t:chatID[:userID]" → baseChat="platform:chatID" (tag dropped),
+//     userOrThread="userID" (or "" when absent) — when t is a single-char type
+//     tag (DingTalk's "g"/"d" group-vs-direct marker, QQ/QQBot's "g" shared-group
+//     marker).
+//
+// The type-tag case must be checked before the generic 2-/3-/4-segment cases:
+// without it, a tagged key like "dingtalk:g:convID:staffID" has 4
+// colon-separated segments and would otherwise be misread as Feishu's
+// thread-isolation shape ("platform:chatID:root:rootID"), collapsing every
+// DingTalk *group* chat into one baseChat ("dingtalk:g") regardless of
+// conversation ID, and folding convID+staffID together into userOrThread.
+// Even the shorter 3-segment shared-session form ("dingtalk:g:convID") is
+// affected the same way without this branch. Both corrupt chat-scope
+// isolation (ScopeFromSessionKey → Chat/<chatID>/ directory) and the per-user
+// identity recordUsage derives for the usage-recorder's SenderID/turns.user_id
+// column — every group chat of the same type sharing one identity. Dropping
+// the tag from baseChat (rather than keeping "platform:t:chatID") matches the
+// existing, independently-implemented heuristic in engine.go's
+// extractChannelID/extractUserID/extractWorkspaceChannelKey, so all three
+// agree on the same chatID for a given key.
 func ParseSessionKey(sessionKey string) (platform, baseChat, userOrThread string) {
 	parts := strings.SplitN(sessionKey, ":", 4)
 	if len(parts) < 2 {
@@ -800,6 +820,18 @@ func ParseSessionKey(sessionKey string) (platform, baseChat, userOrThread string
 	if len(parts) == 2 {
 		// "platform:chatID" - shared session mode
 		return platform, sessionKey, ""
+	}
+	if len(parts[1]) == 1 {
+		// Re-split so a 4th field (userID) is captured instead of being
+		// absorbed into chatID by the SplitN(...,4) above.
+		tagged := strings.SplitN(sessionKey, ":", 5)
+		chatID := tagged[2]
+		if len(tagged) >= 4 {
+			// "platform:t:chatID:userID" - default mode
+			return platform, platform + ":" + chatID, tagged[3]
+		}
+		// "platform:t:chatID" - shared session mode, no per-user split
+		return platform, platform + ":" + chatID, ""
 	}
 	if len(parts) == 3 {
 		// "platform:chatID:userID" - default mode

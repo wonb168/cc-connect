@@ -232,3 +232,58 @@ func TestRecordUsage_PrefersUnionIDOverSessionKeySender(t *testing.T) {
 		t.Errorf("SessionKey = %q, want unchanged sessionKey with open_id", got.SessionKey)
 	}
 }
+
+// TestRecordUsage_DingTalkSenderID pins the per-turn identity written to the
+// usage-recorder's SenderID field (destination: turns.user_id) for DingTalk.
+// DingTalk session keys carry a single-char conversation-type tag as the 2nd
+// segment ("dingtalk:g:convID:staffID" for group, "dingtalk:d:...:staffID"
+// for direct), giving 4 colon-separated segments — the same count as Feishu's
+// "platform:chatID:root:rootID" thread-isolation shape. Before ParseSessionKey
+// special-cased the single-char tag, it misread parts[2] (a conversation ID)
+// as if it were the literal "root" marker, so SenderID came out as
+// "convID:staffID" (or just "convID" in shared-session mode) instead of the
+// bare staffID — and worse, every DingTalk group conversation collapsed onto
+// the same identity regardless of which staffID actually sent the message
+// (see TestParseSessionKey's "dingtalk" cases in session_test.go for the
+// baseChat side of the same bug).
+func TestRecordUsage_DingTalkSenderID(t *testing.T) {
+	var (
+		mu  sync.Mutex
+		got UsageRecord
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		_ = json.NewDecoder(r.Body).Decode(&got)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	e := &Engine{agent: &stubAgent{}, name: "viking"}
+	e.SetUsageRecorderEndpoint(srv.URL)
+
+	// No SessionManager/UnionID involved — DingTalk has no union_id concept
+	// (see CONTEXT.md UID section), so SenderID must come straight from the
+	// bare staffID embedded in the session key.
+	e.recordUsage("dingtalk:g:cidXXX:staff1008", "claude-opus-4-8[1m]", "agent-sess-dt", nil, nil, Event{CostUSD: 0.05}, nil, 0, time.Now())
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		mu.Lock()
+		done := got.SenderID != ""
+		mu.Unlock()
+		if done || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if got.Platform != "dingtalk" {
+		t.Errorf("Platform = %q, want dingtalk", got.Platform)
+	}
+	if got.SenderID != "staff1008" {
+		t.Errorf("SenderID = %q, want bare staffID %q (not folded with the conversation ID)", got.SenderID, "staff1008")
+	}
+}

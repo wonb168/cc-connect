@@ -604,6 +604,50 @@ func TestParseSessionKey(t *testing.T) {
 			wantBaseChat: "telegram:-100123",
 			wantUser:     "root:msg456",
 		},
+		// DingTalk tags its conversation type ("g"=group, "d"=direct) as a
+		// single-char second segment, so a per-user key has 4 colon-separated
+		// segments — the same shape as Feishu's "platform:chatID:root:rootID"
+		// thread-isolation key. Without special-casing the single-char tag,
+		// parts[2] ("cidXXX", a conversation ID) gets misread as the literal
+		// "root" marker, and two different DingTalk group chats collapse into
+		// the same baseChat ("dingtalk:g") regardless of conversation ID —
+		// corrupting both chat-scope isolation and the usage-recorder's
+		// per-sender identity. Mirrors engine.go's extractChannelID/
+		// extractUserID, which already special-case this shape.
+		{
+			key:          "dingtalk:g:cidXXX:staff1",
+			wantPlatform: "dingtalk",
+			wantBaseChat: "dingtalk:cidXXX",
+			wantUser:     "staff1",
+		},
+		{
+			key:          "dingtalk:d:cidYYY:staff2",
+			wantPlatform: "dingtalk",
+			wantBaseChat: "dingtalk:cidYYY",
+			wantUser:     "staff2",
+		},
+		// A different conversation ID must yield a different baseChat — the
+		// regression this fix targets (both used to collapse to "dingtalk:g").
+		{
+			key:          "dingtalk:g:cidOther:staff1",
+			wantPlatform: "dingtalk",
+			wantBaseChat: "dingtalk:cidOther",
+			wantUser:     "staff1",
+		},
+		// share_session_in_channel mode: tagged 3-segment form, no per-user split.
+		{
+			key:          "dingtalk:g:cidZZZ",
+			wantPlatform: "dingtalk",
+			wantBaseChat: "dingtalk:cidZZZ",
+			wantUser:     "",
+		},
+		// QQ shares the same single-char group-tag convention.
+		{
+			key:          "qq:g:12345",
+			wantPlatform: "qq",
+			wantBaseChat: "qq:12345",
+			wantUser:     "",
+		},
 		{
 			key:          "invalid",
 			wantPlatform: "invalid",
@@ -643,6 +687,11 @@ func TestScopeFromSessionKey(t *testing.T) {
 		{"feishu:oc_abc123:on_union789", "oc_abc123", "on_union789"},
 		{"feishu:oc_abc123", "oc_abc123", ""},                          // channel-shared: chat-level only
 		{"telegram:-100123:root:msg456", "-100123", "root:msg456"},     // thread mode
+		// DingTalk's single-char conversation-type tag must not corrupt the
+		// derived ChatID — two different conversation IDs must scope to two
+		// different Chat/<chatID>/ directories, not collapse onto "g" or "d".
+		{"dingtalk:g:cidXXX:staff1", "cidXXX", "staff1"},
+		{"dingtalk:g:cidOther:staff1", "cidOther", "staff1"},
 		{"invalid", "", ""},
 		{"", "", ""},
 	}
