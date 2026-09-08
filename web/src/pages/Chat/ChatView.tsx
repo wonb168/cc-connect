@@ -19,6 +19,7 @@ import Markdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import rehypeHighlight from 'rehype-highlight';
 import { cn } from '@/lib/utils';
+import { makeWebSessionKey } from '@/lib/clientId';
 
 // ── Markdown renderers ───────────────────────────────────────
 
@@ -317,9 +318,9 @@ export default function ChatView() {
   // Mirrors cmdResult.command so card-action callbacks can route follow-ups back to the panel
   const cmdPanelRef = useRef<string | null>(null);
 
-  // Web platform uses its own per-project session key by default.
+  // Web platform uses its own per-project, per-browser session key by default.
   // Only use the original session's key when the user explicitly switches via the drawer.
-  const webSessionKey = projectName ? `bridge:web-admin:${projectName}` : '';
+  const webSessionKey = projectName ? makeWebSessionKey(projectName) : '';
   const sessionKey = userPickedSession && currentSession?.session_key
     ? currentSession.session_key
     : webSessionKey;

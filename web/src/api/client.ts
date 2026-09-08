@@ -34,6 +34,8 @@ class ApiClient {
       method,
       headers: this.headers(),
       body: body ? JSON.stringify(body) : undefined,
+      // Send the session cookie issued by /login. Harmless in token mode.
+      credentials: 'include',
     });
     if (res.status === 401 && this.onUnauthorized) {
       this.onUnauthorized();
@@ -56,7 +58,7 @@ class ApiClient {
   async raw(path: string): Promise<string> {
     const h: HeadersInit = {};
     if (this.token) h['Authorization'] = `Bearer ${this.token}`;
-    const res = await fetch(`${API_BASE}${path}`, { headers: h });
+    const res = await fetch(`${API_BASE}${path}`, { headers: h, credentials: 'include' });
     if (res.status === 401 && this.onUnauthorized) {
       this.onUnauthorized();
       throw new ApiError('Unauthorized', 401);

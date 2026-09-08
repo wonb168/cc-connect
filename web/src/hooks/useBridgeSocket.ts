@@ -1,5 +1,6 @@
 import { useEffect, useRef, useCallback, useState } from 'react';
 import api from '@/api/client';
+import { browserId, bridgePlatformName } from '@/lib/clientId';
 
 export type BridgeIncoming =
   | { type: 'register_ack'; ok: boolean; error?: string }
@@ -32,7 +33,7 @@ export interface UseBridgeSocketOptions {
   onMessage: (msg: BridgeIncoming) => void;
 }
 
-export function useBridgeSocket({ bridgeCfg, platformName = 'web', sessionKey, projectName, onMessage }: UseBridgeSocketOptions) {
+export function useBridgeSocket({ bridgeCfg, platformName = bridgePlatformName, sessionKey, projectName, onMessage }: UseBridgeSocketOptions) {
   const wsRef = useRef<WebSocket | null>(null);
   const onMessageRef = useRef(onMessage);
   onMessageRef.current = onMessage;
@@ -48,15 +49,15 @@ export function useBridgeSocket({ bridgeCfg, platformName = 'web', sessionKey, p
   const sendMessage = useCallback((content: string) => {
     send({
       type: 'message',
-      msg_id: `web-${Date.now()}`,
+      msg_id: `${platformName}-${Date.now()}`,
       session_key: sessionKey,
-      user_id: 'web-admin',
-      user_name: 'Web Admin',
+      user_id: browserId,
+      user_name: `Web ${browserId}`,
       content,
       reply_ctx: sessionKey,
       project: projectName || '',
     });
-  }, [send, sessionKey, projectName]);
+  }, [send, sessionKey, projectName, platformName]);
 
   const sendCardAction = useCallback((action: string) => {
     send({

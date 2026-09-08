@@ -182,6 +182,40 @@ type ManagementConfig struct {
 	Port        int      `toml:"port,omitempty"`         // listen port; default 9820
 	Token       string   `toml:"token,omitempty"`        // shared secret for authentication; required
 	CORSOrigins []string `toml:"cors_origins,omitempty"` // allowed CORS origins; empty = no CORS
+	// Users enables named accounts for the web dashboard. When empty, Token
+	// remains the only credential and every caller is an admin — the original
+	// single-secret behaviour. Adding users does not disable Token; it stays
+	// valid as a legacy admin so existing deployments keep working.
+	Users []ManagementUser `toml:"users,omitempty"`
+	// SessionTTLMins is how long a login session stays valid. Default 720 (12h).
+	SessionTTLMins int `toml:"session_ttl_mins,omitempty"`
+}
+
+// Management user roles.
+const (
+	ManagementRoleAdmin  = "admin"  // full read/write access
+	ManagementRoleViewer = "viewer" // read-only; all non-GET requests are rejected
+)
+
+// ManagementUser is a named account for the management API / web dashboard.
+type ManagementUser struct {
+	Name string `toml:"name"`
+	// PasswordHash is a bcrypt hash. Generate with `cc-connect web adduser`.
+	PasswordHash string `toml:"password_hash,omitempty"`
+	// Token is an optional per-user API token for non-interactive clients.
+	// Unlike PasswordHash it is stored in plaintext, so prefer passwords for
+	// humans and reserve tokens for scripts.
+	Token string `toml:"token,omitempty"`
+	// Role is "admin" (default) or "viewer".
+	Role string `toml:"role,omitempty"`
+}
+
+// NormalizedRole returns the user's role, defaulting to admin when unset.
+func (u ManagementUser) NormalizedRole() string {
+	if strings.EqualFold(strings.TrimSpace(u.Role), ManagementRoleViewer) {
+		return ManagementRoleViewer
+	}
+	return ManagementRoleAdmin
 }
 
 // Display mode constants.
@@ -1161,6 +1195,9 @@ func (c *Config) validateInternal(permissive bool) error {
 	default:
 		return fmt.Errorf("config: relay.visibility must be \"full\", \"summary\", or \"none\"")
 	}
+	if err := validateManagementConfig(&c.Management); err != nil {
+		return err
+	}
 	if len(c.Projects) == 0 {
 		return fmt.Errorf("config: at least one [[projects]] entry is required")
 	}
@@ -1295,6 +1332,38 @@ func validateReferenceConfig(prefix string, rc ReferenceConfig) error {
 	}
 	if _, ok := supportedReferenceEnclosureStyles[strings.ToLower(strings.TrimSpace(rc.EnclosureStyle))]; !ok {
 		return fmt.Errorf("config: %s.references.enclosure_style has unsupported value %q", prefix, rc.EnclosureStyle)
+	}
+	return nil
+}
+
+// validateManagementConfig checks the [management] section, in particular the
+// [[management.users]] accounts used by the web dashboard.
+func validateManagementConfig(m *ManagementConfig) error {
+	if m == nil || len(m.Users) == 0 {
+		return nil
+	}
+	seen := make(map[string]bool, len(m.Users))
+	for i, u := range m.Users {
+		prefix := fmt.Sprintf("management.users[%d]", i)
+		name := strings.TrimSpace(u.Name)
+		if name == "" {
+			return fmt.Errorf("config: %s has empty name", prefix)
+		}
+		lower := strings.ToLower(name)
+		if seen[lower] {
+			return fmt.Errorf("config: %s: duplicate user name %q", prefix, name)
+		}
+		seen[lower] = true
+
+		if u.PasswordHash == "" && u.Token == "" {
+			return fmt.Errorf("config: %s (%q) needs password_hash or token; "+
+				"generate one with `cc-connect web adduser %s`", prefix, name, name)
+		}
+		if r := strings.TrimSpace(u.Role); r != "" &&
+			!strings.EqualFold(r, ManagementRoleAdmin) && !strings.EqualFold(r, ManagementRoleViewer) {
+			return fmt.Errorf("config: %s (%q): role must be %q or %q, got %q",
+				prefix, name, ManagementRoleAdmin, ManagementRoleViewer, u.Role)
+		}
 	}
 	return nil
 }
@@ -4041,6 +4110,57 @@ type WebSetupResult struct {
 	BridgePort      int
 	BridgeToken     string
 	AlreadyEnabled  bool
+}
+
+// AddManagementUser adds or updates a named account in [[management.users]].
+// The password is hashed by the caller; this function never sees plaintext.
+// Returns true when an existing account was replaced rather than added.
+func AddManagementUser(name, passwordHash, role string) (updated bool, err error) {
+	configMu.Lock()
+	defer configMu.Unlock()
+	if ConfigPath == "" {
+		return false, fmt.Errorf("config path not set")
+	}
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return false, fmt.Errorf("user name is required")
+	}
+	if role == "" {
+		role = ManagementRoleAdmin
+	}
+	if !strings.EqualFold(role, ManagementRoleAdmin) && !strings.EqualFold(role, ManagementRoleViewer) {
+		return false, fmt.Errorf("role must be %q or %q, got %q", ManagementRoleAdmin, ManagementRoleViewer, role)
+	}
+
+	data, err := os.ReadFile(ConfigPath)
+	if err != nil {
+		return false, fmt.Errorf("read config: %w", err)
+	}
+	cfg := &Config{}
+	if err := toml.Unmarshal(data, cfg); err != nil {
+		return false, fmt.Errorf("parse config: %w", err)
+	}
+
+	for i, u := range cfg.Management.Users {
+		if strings.EqualFold(strings.TrimSpace(u.Name), name) {
+			cfg.Management.Users[i].PasswordHash = passwordHash
+			cfg.Management.Users[i].Role = strings.ToLower(role)
+			if err := saveConfig(cfg); err != nil {
+				return false, fmt.Errorf("save config: %w", err)
+			}
+			return true, nil
+		}
+	}
+
+	cfg.Management.Users = append(cfg.Management.Users, ManagementUser{
+		Name:         name,
+		PasswordHash: passwordHash,
+		Role:         strings.ToLower(role),
+	})
+	if err := saveConfig(cfg); err != nil {
+		return false, fmt.Errorf("save config: %w", err)
+	}
+	return false, nil
 }
 
 // EnableWebAdmin enables the bridge and management sections in config.toml.

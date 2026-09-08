@@ -588,6 +588,61 @@ func TestBridge_AdapterReplace(t *testing.T) {
 	}
 }
 
+func TestBridge_DistinctAdapterNamesCoexist(t *testing.T) {
+	bs, wsURL := startTestBridge(t, "")
+
+	conn1 := dialWS(t, wsURL, nil)
+	register(t, conn1, "web-abc123-tab1", []string{"text"})
+
+	conn2 := dialWS(t, wsURL, nil)
+	register(t, conn2, "web-abc123-tab2", []string{"text"})
+
+	if got := len(bs.ConnectedAdapters()); got != 2 {
+		t.Fatalf("ConnectedAdapters() = %d, want 2 (tabs must not evict each other)", got)
+	}
+}
+
+func TestBridge_PlatformFromSessionKey(t *testing.T) {
+	bs, wsURL := startTestBridge(t, "")
+
+	conn := dialWS(t, wsURL, nil)
+	register(t, conn, "wechat", []string{"text"})
+
+	// Exact adapter-name match wins.
+	if got := bs.platformFromSessionKey("wechat:user123:user123"); got != "wechat" {
+		t.Fatalf("exact match = %q, want wechat", got)
+	}
+	// Unknown platform resolves to nothing.
+	if got := bs.platformFromSessionKey("telegram:user123:user123"); got != "" {
+		t.Fatalf("unknown platform = %q, want empty", got)
+	}
+	// A bare prefix must not match an unrelated longer adapter name.
+	if got := bs.platformFromSessionKey("we:chat:chat"); got != "" {
+		t.Fatalf("partial-word prefix = %q, want empty", got)
+	}
+}
+
+func TestBridge_PlatformFromSessionKeyPrefixFallback(t *testing.T) {
+	bs, wsURL := startTestBridge(t, "")
+
+	// Two tabs of one browser: distinct adapter names, one shared session key.
+	conn2 := dialWS(t, wsURL, nil)
+	register(t, conn2, "web-abc123-tab2", []string{"text"})
+	conn1 := dialWS(t, wsURL, nil)
+	register(t, conn1, "web-abc123-tab1", []string{"text"})
+
+	// No adapter is named "web-abc123", so the prefix fallback picks a live tab.
+	got := bs.platformFromSessionKey("web-abc123:myproject:abc123")
+	if got != "web-abc123-tab1" {
+		t.Fatalf("prefix fallback = %q, want web-abc123-tab1 (lowest name, deterministic)", got)
+	}
+
+	// A different browser's key must not resolve to this browser's tabs.
+	if got := bs.platformFromSessionKey("web-zzz999:myproject:zzz999"); got != "" {
+		t.Fatalf("other browser = %q, want empty", got)
+	}
+}
+
 func TestSerializeCard(t *testing.T) {
 	card := NewCard().
 		Title("Model", "blue").

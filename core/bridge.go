@@ -1338,16 +1338,32 @@ func bridgeMetadataStringListContains(metadata map[string]any, key, want string)
 }
 
 func (bs *BridgeServer) platformFromSessionKey(sessionKey string) string {
-	if idx := strings.Index(sessionKey, ":"); idx > 0 {
-		candidate := sessionKey[:idx]
-		bs.mu.RLock()
-		_, ok := bs.adapters[candidate]
-		bs.mu.RUnlock()
-		if ok {
-			return candidate
+	idx := strings.Index(sessionKey, ":")
+	if idx <= 0 {
+		return ""
+	}
+	candidate := sessionKey[:idx]
+
+	bs.mu.RLock()
+	defer bs.mu.RUnlock()
+
+	if _, ok := bs.adapters[candidate]; ok {
+		return candidate
+	}
+
+	// Fallback for adapters that register one connection per client instance
+	// under a shared session identity — the web dashboard registers as
+	// "<sessionPlatform>-<tabID>" so that multiple tabs do not evict each
+	// other, while all of them share one session key. Any live connection can
+	// deliver the message; pick the lowest name so the choice is deterministic.
+	prefix := candidate + "-"
+	best := ""
+	for name := range bs.adapters {
+		if strings.HasPrefix(name, prefix) && (best == "" || name < best) {
+			best = name
 		}
 	}
-	return ""
+	return best
 }
 
 // resolveEngine finds the engine to handle a message.

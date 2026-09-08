@@ -173,7 +173,15 @@
     "serverUrl": "サーバー URL",
     "connect": "接続",
     "invalidToken": "トークンが無効または期限切れです",
-    "logout": "ログアウト"
+    "logout": "ログアウト",
+    "username": "ユーザー名",
+    "password": "パスワード",
+    "signIn": "ログイン",
+    "invalidCredentials": "ユーザー名またはパスワードが正しくありません",
+    "useToken": "API トークンを使用",
+    "usePassword": "ユーザー名とパスワードを使用",
+    "tooManyAttempts": "試行回数が多すぎます。しばらくしてからお試しください。",
+    "readOnly": "読み取り専用"
   },
   "common": {
     "loading": "読み込み中…",

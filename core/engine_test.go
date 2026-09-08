@@ -1904,6 +1904,74 @@ func TestProcessInteractiveEvents_CardProgressUsesStructuredPayloadWhenSupported
 	}
 }
 
+// TestProcessInteractiveEvents_CardProgressTruncatesToolInputByToolMaxLen verifies
+// that when progress_style=card is used (e.g. Feishu), a long tool input is
+// truncated to display.ToolMaxLen in the structured card payload. The original
+// event.ToolInput must remain unmutated.
+func TestProcessInteractiveEvents_CardProgressTruncatesToolInputByToolMaxLen(t *testing.T) {
+	p := &stubCompactProgressPlatform{
+		stubPlatformEngine: stubPlatformEngine{n: "feishu"},
+		style:              "card",
+		supportPayload:     true,
+	}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	e.SetDisplayConfig(DisplayCfg{
+		ThinkingMessages: true,
+		ThinkingMaxLen:   300,
+		ToolMaxLen:       50,
+		ToolMessages:     true,
+		Mode:             "full",
+	})
+	sessionKey := "feishu:user-card-truncate"
+	session := e.sessions.GetOrCreateActive(sessionKey)
+	agentSession := newControllableSession("s-card-truncate")
+	state := &interactiveState{
+		agentSession: agentSession,
+		platform:     p,
+		replyCtx:     "ctx-card-truncate",
+	}
+	e.interactiveStates[sessionKey] = state
+
+	longInput := strings.Repeat("abcdefghij", 12) // 120 chars
+	agentSession.events <- Event{Type: EventThinking, Content: "Plan"}
+	toolEvt := Event{Type: EventToolUse, ToolName: "Bash", ToolInput: longInput}
+	agentSession.events <- toolEvt
+	agentSession.events <- Event{Type: EventText, Content: "done"}
+	agentSession.events <- Event{Type: EventResult, Content: "done", Done: true}
+
+	e.processInteractiveEvents(state, session, e.sessions, sessionKey, "m-card-truncate", time.Now(), nil, nil, state.replyCtx)
+
+	if toolEvt.ToolInput != longInput {
+		t.Fatalf("event.ToolInput was mutated: got len=%d, want len=%d", len(toolEvt.ToolInput), len(longInput))
+	}
+
+	edits := p.getPreviewEdits()
+	var toolUseText string
+	for _, edit := range edits {
+		payload, ok := ParseProgressCardPayload(edit)
+		if !ok {
+			continue
+		}
+		for _, item := range payload.Items {
+			if item.Kind == ProgressEntryToolUse {
+				toolUseText = item.Text
+			}
+		}
+	}
+	if toolUseText == "" {
+		t.Fatalf("no ProgressEntryToolUse found in any card edit; edits=%v", edits)
+	}
+	if utf8.RuneCountInString(toolUseText) > 50+len("...") {
+		t.Fatalf("card tool input not truncated: runeCount=%d, content=%q", utf8.RuneCountInString(toolUseText), toolUseText)
+	}
+	if !strings.HasSuffix(toolUseText, "...") {
+		t.Fatalf("expected truncated tool input to end with '...', got %q", toolUseText)
+	}
+	if !strings.HasPrefix(toolUseText, "abcdefghij") {
+		t.Fatalf("expected truncated tool input to start with original prefix, got %q", toolUseText)
+	}
+}
+
 func TestProcessInteractiveEvents_RichCardShowsThinkingContent(t *testing.T) {
 	p := &stubCompactProgressPlatform{
 		stubPlatformEngine: stubPlatformEngine{n: "feishu"},
@@ -7166,6 +7234,11 @@ type controllableAgentSession struct {
 	usageErr        error
 	costUSD         float64
 	sessionCostUSD  float64
+
+	// Teardown controls, for tests that exercise the close/spawn race.
+	closeDelay    time.Duration // how long Close() blocks before returning
+	closeErr      error         // what Close() reports (e.g. "process still alive")
+	closeFinished atomic.Bool   // set once Close() has returned
 }
 
 func newControllableSession(id string) *controllableAgentSession {
@@ -7197,6 +7270,9 @@ func (s *controllableAgentSession) GetLastCostUSD() float64        { return s.co
 func (s *controllableAgentSession) GetSessionCostUSD() float64     { return s.sessionCostUSD }
 func (s *controllableAgentSession) Alive() bool                    { return s.alive }
 func (s *controllableAgentSession) Close() error {
+	if s.closeDelay > 0 {
+		time.Sleep(s.closeDelay)
+	}
 	s.alive = false
 	close(s.events)
 	select {
@@ -7204,7 +7280,8 @@ func (s *controllableAgentSession) Close() error {
 	default:
 		close(s.closed)
 	}
-	return nil
+	s.closeFinished.Store(true)
+	return s.closeErr
 }
 
 func waitForInteractiveStateRemoved(t *testing.T, e *Engine, key string) {
@@ -9851,6 +9928,124 @@ func TestAutoCompress_TriggerAfterResult(t *testing.T) {
 		t.Fatalf("expected /compact auto-compress, got %q", last)
 	}
 }
+
+// TestAutoCompress_UsesRealUsageWhenAvailable verifies that when the agent session
+// implements ContextUsageReporter and reports a real API token count, the auto-compress
+// trigger uses that real number instead of the text-only heuristic — even when the
+// heuristic alone is below threshold. This guards against the bug where sessions with
+// large tool_use/tool_result blocks (the bulk of real context) never trigger compress.
+func TestAutoCompress_UsesRealUsageWhenAvailable(t *testing.T) {
+	p := &stubPlatformEngine{n: "test"}
+	sess := newQueuingSession("auto-compress-real-usage")
+	agent := &stubCompressorAgent{cmd: "/compact"}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+	// Heuristic threshold of 4 tokens would NOT trigger on a short message,
+	// but the real usage of 50_000 tokens (representing tool_use/tool_result overhead)
+	// MUST trigger.
+	e.SetAutoCompressConfig(true, 4, 0)
+
+	key := "test:user1"
+	state := &interactiveState{
+		agentSession: sess,
+		platform:     p,
+		replyCtx:     "ctx",
+	}
+	e.interactiveMu.Lock()
+	e.interactiveStates[key] = state
+	e.interactiveMu.Unlock()
+
+	// Inject a real usage snapshot: 50k tokens used of a 200k window.
+	sess.contextUsage = &ContextUsage{
+		UsedTokens:    50_000,
+		ContextWindow: 200_000,
+	}
+
+	session := e.sessions.GetOrCreateActive(key)
+	session.AddHistory("user", "hi")
+
+	go e.processInteractiveEvents(state, session, e.sessions, key, "msg1", time.Now(), func() {}, nil, nil)
+	sess.events <- Event{Type: EventResult, Content: "response", Done: true}
+
+	deadline := time.After(2 * time.Second)
+	for {
+		sess.sendMu.Lock()
+		n := len(sess.sendCalls)
+		sess.sendMu.Unlock()
+		if n > 0 {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("timed out waiting for auto-compress send — real usage (50k) should have triggered despite short text heuristic")
+		default:
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+
+	sess.sendMu.Lock()
+	last := sess.sendCalls[len(sess.sendCalls)-1]
+	sess.sendMu.Unlock()
+	if last != "/compact" {
+		t.Fatalf("expected /compact auto-compress driven by real usage, got %q", last)
+	}
+}
+
+// TestAutoCompress_FallsBackToHeuristicWhenNoUsage verifies that when the agent
+// session's GetContextUsage returns nil (no usage data yet), the trigger falls
+// back to the text-only heuristic — backward compatible behavior.
+func TestAutoCompress_FallsBackToHeuristicWhenNoUsage(t *testing.T) {
+	p := &stubPlatformEngine{n: "test"}
+	// Use a queuing session whose contextUsage is nil — exercises the
+	// "real usage unavailable, fall back to text heuristic" path.
+	sess := newQueuingSession("no-usage")
+	agent := &stubCompressorAgent{cmd: "/compact"}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+	e.SetAutoCompressConfig(true, 4, 0)
+
+	key := "test:user1"
+	state := &interactiveState{
+		agentSession: sess,
+		platform:     p,
+		replyCtx:     "ctx",
+	}
+	e.interactiveMu.Lock()
+	e.interactiveStates[key] = state
+	e.interactiveMu.Unlock()
+
+	session := e.sessions.GetOrCreateActive(key)
+	// Long enough text to cross the heuristic threshold of 4 tokens.
+	session.AddHistory("user", strings.Repeat("a", 64))
+
+	go e.processInteractiveEvents(state, session, e.sessions, key, "msg1", time.Now(), func() {}, nil, nil)
+	sess.events <- Event{Type: EventResult, Content: "response", Done: true}
+
+	deadline := time.After(2 * time.Second)
+	for {
+		sess.sendMu.Lock()
+		n := len(sess.sendCalls)
+		sess.sendMu.Unlock()
+		if n > 0 {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("timed out waiting for auto-compress send — heuristic fallback should have triggered")
+		default:
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+
+	sess.sendMu.Lock()
+	last := sess.sendCalls[len(sess.sendCalls)-1]
+	sess.sendMu.Unlock()
+	if last != "/compact" {
+		t.Fatalf("expected /compact via heuristic fallback, got %q", last)
+	}
+}
+
+// noUsageAgentSession is no longer used — see TestAutoCompress_FallsBackToHeuristicWhenNoUsage
+// for the actual test, which uses newQueuingSession() directly (its GetContextUsage
+// returns nil because contextUsage is unset).
 
 func TestCmdCompress_SessionBusy_RepliesPreviousProcessing(t *testing.T) {
 	p := &stubPlatformEngine{n: "test"}
@@ -13907,6 +14102,86 @@ func TestUnsolicitedReader_RelaysEventResult(t *testing.T) {
 	}
 }
 
+// TestUnsolicitedReader_ResetsIdleCloseOnEventResult verifies the P1-C P1-1
+// fix: an unsolicited EventResult must re-arm the per-session idle close
+// timer. Before the fix, the idle timer was only scheduled at the end of
+// the last foreground turn, so a long-running background turn (background
+// task that takes longer than the idle timeout) would be killed mid-flight
+// when the original timer fired.
+func TestUnsolicitedReader_ResetsIdleCloseOnEventResult(t *testing.T) {
+	p := &stubPlatformEngine{n: "test"}
+	sess := newControllableSession("unsol-idle-reset")
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	defer func() { _ = e.Stop() }()
+	e.SetAgentSessionIdleTimeout(50 * time.Millisecond)
+
+	sessions := e.sessions
+	session := sessions.GetOrCreateActive("test:ch_idle:u1")
+
+	state := &interactiveState{
+		agentSession:     sess,
+		platform:         p,
+		replyCtx:         "ctx",
+		eventsNeedResync: false,
+	}
+	iKey := "test:ch_idle:u1"
+	e.interactiveMu.Lock()
+	e.interactiveStates[iKey] = state
+	e.interactiveMu.Unlock()
+
+	// Pretend a previous foreground turn already scheduled an idle close
+	// with token N and a known cancel function. The cancel must be
+	// invoked by the unsolicited reader's EventResult path as part of
+	// re-scheduling.
+	var prevCancelCalled atomic.Int32
+	state.mu.Lock()
+	state.agentSessionIdleCancel = func() { prevCancelCalled.Add(1) }
+	state.agentSessionIdleToken = 42
+	state.mu.Unlock()
+
+	e.startUnsolicitedReader(state, session, sessions, iKey, "")
+	defer e.stopUnsolicitedReader(state)
+
+	// Send an EventResult — this is the trigger for re-scheduling.
+	sess.events <- Event{Type: EventResult, Content: "background step done", Done: true}
+
+	// Wait for the reader to drain the EventResult and reach the schedule
+	// call. The reader sends the relayed content asynchronously; we poll
+	// until either the cancel fires or a generous timeout elapses.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if prevCancelCalled.Load() > 0 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if prevCancelCalled.Load() == 0 {
+		t.Fatal("expected EventResult path to call cancelAgentSessionIdleClose before re-scheduling")
+	}
+
+	// After re-scheduling, token must have advanced and a fresh cancel
+	// function must be installed. A stale token would risk the cleanup
+	// path closing the live agent session while the background turn is
+	// still running.
+	state.mu.Lock()
+	newToken := state.agentSessionIdleToken
+	newCancel := state.agentSessionIdleCancel
+	state.mu.Unlock()
+	if newToken == 42 {
+		t.Errorf("expected agentSessionIdleToken to advance after re-schedule, still %d", newToken)
+	}
+	if newCancel == nil {
+		t.Fatal("expected a fresh agentSessionIdleCancel to be installed after EventResult")
+	}
+
+	// Cancel the freshly installed timer so the test does not leak the
+	// background goroutine until idle timeout fires.
+	state.mu.Lock()
+	state.agentSessionIdleCancel = nil
+	state.agentSessionIdleToken = 0
+	state.mu.Unlock()
+}
+
 // TestUnsolicitedReader_StopsOnCancel verifies that stopUnsolicitedReader
 // cleanly stops the reader goroutine and waits for it to exit.
 func TestUnsolicitedReader_StopsOnCancel(t *testing.T) {
@@ -14056,9 +14331,16 @@ func TestUnsolicitedReader_PermissionDeny(t *testing.T) {
 	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
 	defer e.Stop()
 
-	sess := newControllableSession("unsol-perm")
+	// NOTE: constructed inline rather than copying a *controllableAgentSession,
+	// because that struct now carries an atomic.Bool (closeFinished) and must
+	// not be copied by value.
 	permRecorder := &permRecordingSession{
-		controllableAgentSession: *sess,
+		controllableAgentSession: controllableAgentSession{
+			sessionID: "unsol-perm",
+			alive:     true,
+			events:    make(chan Event, 8),
+			closed:    make(chan struct{}),
+		},
 	}
 
 	sessions := e.sessions

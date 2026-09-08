@@ -65,8 +65,50 @@ token = "mgmt-secret"
 | `enabled`  | boolean | `false`  | 是否启用管理 API 服务                     |
 | `port`     | integer | `9820`   | 监听 TCP 端口                             |
 | `token`    | string  | (必填)   | 认证用共享密钥                            |
+| `users`    | array   | `[]`     | 具名账号（见下），可选                    |
+| `session_ttl_mins` | integer | `720` | 登录会话有效期（分钟）              |
 
 当 `enabled` 为 `false` 时，管理 API 不会启动。令牌应为强随机字符串（建议 32 字符以上）。
+
+### 2.1.1 具名账号（可选）
+
+默认情况下共享 `token` 是唯一凭据，任何持有者都拥有全部权限。添加
+`[[management.users]]` 可以为每个人分配独立账号：
+
+```toml
+[[management.users]]
+name = "alice"
+password_hash = "$2a$10$..."   # bcrypt
+role = "admin"                 # 读写全部权限（默认）
+
+[[management.users]]
+name = "bob"
+password_hash = "$2a$10$..."
+role = "viewer"                # 只读：所有非 GET 请求都会被拒绝
+
+[[management.users]]
+name = "ci-script"
+token = "per-user-api-token"   # 供脚本等非交互式客户端使用
+role = "viewer"
+```
+
+请用 CLI 创建账号，不要手写哈希：
+
+```bash
+cc-connect web adduser alice                 # 交互式输入密码
+cc-connect web adduser bob --role viewer
+cc-connect web adduser alice                 # 再次执行即可改密码
+```
+
+| 字段            | 类型   | 说明                                     |
+|-----------------|--------|------------------------------------------|
+| `name`          | string | 登录名，大小写不敏感，必须唯一           |
+| `password_hash` | string | bcrypt 哈希；密码登录必填                |
+| `token`         | string | 可选的用户级 API 令牌（明文，供脚本用）  |
+| `role`          | string | `admin`（默认）或 `viewer`               |
+
+添加用户**不会**停用共享 `token`——它仍作为遗留管理员凭据有效，因此现有部署和
+脚本不受影响。修改账号后需重启 cc-connect。
 
 ### 2.2 基础 URL
 
@@ -104,9 +146,61 @@ GET /api/v1/status?token=mgmt-secret
 
 > **注意：** 查询参数认证适用于难以设置请求头的环境。出于安全考虑，建议使用 Bearer 令牌（URL 中的令牌可能被记录到日志）。
 
-### 3.3 未授权响应
+### 3.3 密码登录（具名账号）
 
-若令牌缺失或无效：
+配置了 `[[management.users]]` 后，客户端可以用用户名和密码换取会话 Cookie。
+
+```
+POST /api/v1/login
+Content-Type: application/json
+
+{"username": "alice", "password": "..."}
+```
+
+成功后响应会设置 `HttpOnly`、`SameSite=Lax`、经 HMAC 签名的 `cc_session`
+Cookie，并返回身份信息：
+
+```json
+{"ok": true, "data": {"name": "alice", "role": "admin"}}
+```
+
+后续请求携带该 Cookie 即可（浏览器自动携带；使用 `fetch` 时需设置
+`credentials: 'include'`）。
+
+| 端点              | 方法   | 说明                                   |
+|-------------------|--------|----------------------------------------|
+| `/api/v1/login`   | POST   | 用凭据换取会话 Cookie                  |
+| `/api/v1/logout`  | POST   | 注销当前会话                           |
+| `/api/v1/me`      | GET    | 当前身份、角色与 `can_write` 标志      |
+
+`GET /api/v1/me` 返回：
+
+```json
+{"ok": true, "data": {"name": "alice", "role": "admin", "can_write": true, "auth_mode": "users"}}
+```
+
+`auth_mode` 在配置了具名账号时为 `users`，否则为 `token`，前端可据此决定是否
+展示密码登录表单。
+
+注意事项：
+
+- 会话仅保存在内存中——重启 cc-connect 会让所有人退出登录。
+- 登录限速为每个客户端地址每分钟 10 次，超出返回 `429 Too Many Requests`。
+- 密码错误与用户不存在返回完全相同的错误信息，因此该端点无法用于枚举账号。
+- 未配置任何账号时，`POST /api/v1/login` 返回 `501 Not Implemented`。
+
+### 3.4 角色
+
+| 角色     | 权限                                                      |
+|----------|-----------------------------------------------------------|
+| `admin`  | 完整读写权限。省略 `role` 时的默认值。                     |
+| `viewer` | 只读。允许 `GET`/`HEAD`，其余方法一律返回 `403`。          |
+
+共享 `token` 以及未配置账号的实例始终具有管理员权限。
+
+### 3.5 未授权响应
+
+若凭据缺失或无效：
 
 - **HTTP 状态：** `401 Unauthorized`
 - **响应体：**
@@ -114,7 +208,19 @@ GET /api/v1/status?token=mgmt-secret
 ```json
 {
   "ok": false,
-  "error": "unauthorized: missing or invalid token"
+  "error": "unauthorized: missing or invalid credentials"
+}
+```
+
+若 `viewer` 尝试写操作：
+
+- **HTTP 状态：** `403 Forbidden`
+- **响应体：**
+
+```json
+{
+  "ok": false,
+  "error": "forbidden: read-only user"
 }
 ```
 

@@ -173,7 +173,15 @@
     "serverUrl": "URL del servidor",
     "connect": "Conectar",
     "invalidToken": "Token no válido o caducado",
-    "logout": "Cerrar sesión"
+    "logout": "Cerrar sesión",
+    "username": "Usuario",
+    "password": "Contraseña",
+    "signIn": "Iniciar sesión",
+    "invalidCredentials": "Usuario o contraseña incorrectos",
+    "useToken": "Usar token de API",
+    "usePassword": "Usar usuario y contraseña",
+    "tooManyAttempts": "Demasiados intentos. Inténtalo más tarde.",
+    "readOnly": "Solo lectura"
   },
   "common": {
     "loading": "Cargando…",

@@ -1,7 +1,7 @@
 import { useTranslation } from 'react-i18next';
 import { useState, useRef, useEffect } from 'react';
 import {
-  RefreshCw, Sun, Moon, Monitor, LogOut, Languages, ChevronDown,
+  RefreshCw, Sun, Moon, Monitor, LogOut, Languages, ChevronDown, User as UserIcon,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useThemeStore } from '@/store/theme';
@@ -21,6 +21,7 @@ export default function Header() {
   const { t, i18n } = useTranslation();
   const { theme, setTheme } = useThemeStore();
   const logout = useAuthStore((s) => s.logout);
+  const me = useAuthStore((s) => s.me);
   const [spinning, setSpinning] = useState(false);
   const [langOpen, setLangOpen] = useState(false);
   const langRef = useRef<HTMLDivElement>(null);
@@ -102,6 +103,22 @@ export default function Header() {
       <button type="button" onClick={() => setTheme(nextTheme[theme])} className={btnCls} aria-label="Theme">
         <ThemeIcon size={16} />
       </button>
+
+      {/* Current user (only when named accounts are in use) */}
+      {me && (
+        <span
+          className="flex items-center gap-1.5 px-2 py-1 rounded-lg text-xs text-gray-500 dark:text-gray-400"
+          title={me.role}
+        >
+          <UserIcon size={14} />
+          <span className="font-medium text-gray-700 dark:text-gray-200">{me.name}</span>
+          {!me.can_write && (
+            <span className="px-1.5 py-0.5 rounded bg-gray-200 dark:bg-gray-700 text-[10px] uppercase tracking-wide">
+              {t('login.readOnly')}
+            </span>
+          )}
+        </span>
+      )}
 
       {/* Logout */}
       <button

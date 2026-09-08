@@ -6,6 +6,8 @@ import { useAuthStore } from '@/store/auth';
 import { useThemeStore } from '@/store/theme';
 import { api } from '@/api/client';
 import { getStatus } from '@/api/status';
+import { login as apiLogin, getMe } from '@/api/auth';
+import { ApiError } from '@/api/client';
 
 const languages = [
   { code: 'en', label: 'EN' },
@@ -22,9 +24,15 @@ export default function Login() {
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
   const loginStore = useAuthStore((s) => s.login);
+  const loginSession = useAuthStore((s) => s.loginSession);
   const { theme, setTheme } = useThemeStore();
   const [token, setToken] = useState('');
   const [serverUrl, setServerUrl] = useState('');
+  const [username, setUsername] = useState('');
+  const [password, setPassword] = useState('');
+  // Password login is the default; token login stays available for setups
+  // without named accounts (and for the ?token= deep link).
+  const [mode, setMode] = useState<'password' | 'token'>('password');
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
   const autoLoginAttempted = useRef(false);
@@ -52,8 +60,7 @@ export default function Login() {
     })();
   }, [searchParams, loginStore, navigate, t]);
 
-  const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
+  const handleTokenSubmit = async () => {
     if (!token.trim()) return;
     setLoading(true);
     setError('');
@@ -68,6 +75,38 @@ export default function Login() {
     } finally {
       setLoading(false);
     }
+  };
+
+  const handlePasswordSubmit = async () => {
+    if (!username.trim() || !password) return;
+    setLoading(true);
+    setError('');
+    try {
+      await apiLogin(username.trim(), password);
+      // The session cookie is set; read back the resolved identity and role.
+      const me = await getMe();
+      loginSession(me);
+      setPassword('');
+      navigate('/');
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 429) {
+        setError(t('login.tooManyAttempts'));
+      } else if (err instanceof ApiError && err.status === 501) {
+        // No accounts configured on this server — token auth is the only option.
+        setError(t('login.invalidCredentials'));
+        setMode('token');
+      } else {
+        setError(t('login.invalidCredentials'));
+      }
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (mode === 'token') void handleTokenSubmit();
+    else void handlePasswordSubmit();
   };
 
   const themeIcons = { light: Sun, dark: Moon, system: Monitor };
@@ -121,32 +160,60 @@ export default function Login() {
           )}
 
           <form onSubmit={handleSubmit} className="space-y-4">
-            <div className="space-y-1.5">
-              <label className="block text-sm font-medium text-gray-700 dark:text-gray-300">{t('login.token')}</label>
-              <input
-                type="password"
-                value={token}
-                onChange={(e) => setToken(e.target.value)}
-                placeholder="mgmt-secret-xxx"
-                className="w-full px-4 py-2.5 text-sm rounded-xl border border-gray-300 dark:border-gray-700 bg-white dark:bg-gray-800/50 text-gray-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-accent/50 focus:border-accent transition-colors placeholder:text-gray-400"
-                autoFocus
-              />
-            </div>
-            <div className="space-y-1.5">
-              <label className="block text-sm font-medium text-gray-700 dark:text-gray-300">
-                {t('login.serverUrl')} <span className="text-gray-400 font-normal">({t('common.optional')})</span>
-              </label>
-              <input
-                type="text"
-                value={serverUrl}
-                onChange={(e) => setServerUrl(e.target.value)}
-                placeholder="http://localhost:9820"
-                className="w-full px-4 py-2.5 text-sm rounded-xl border border-gray-300 dark:border-gray-700 bg-white dark:bg-gray-800/50 text-gray-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-accent/50 focus:border-accent transition-colors placeholder:text-gray-400"
-              />
-            </div>
+            {mode === 'password' ? (
+              <>
+                <div className="space-y-1.5">
+                  <label className="block text-sm font-medium text-gray-700 dark:text-gray-300">{t('login.username')}</label>
+                  <input
+                    type="text"
+                    value={username}
+                    onChange={(e) => setUsername(e.target.value)}
+                    autoComplete="username"
+                    className="w-full px-4 py-2.5 text-sm rounded-xl border border-gray-300 dark:border-gray-700 bg-white dark:bg-gray-800/50 text-gray-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-accent/50 focus:border-accent transition-colors placeholder:text-gray-400"
+                    autoFocus
+                  />
+                </div>
+                <div className="space-y-1.5">
+                  <label className="block text-sm font-medium text-gray-700 dark:text-gray-300">{t('login.password')}</label>
+                  <input
+                    type="password"
+                    value={password}
+                    onChange={(e) => setPassword(e.target.value)}
+                    autoComplete="current-password"
+                    className="w-full px-4 py-2.5 text-sm rounded-xl border border-gray-300 dark:border-gray-700 bg-white dark:bg-gray-800/50 text-gray-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-accent/50 focus:border-accent transition-colors placeholder:text-gray-400"
+                  />
+                </div>
+              </>
+            ) : (
+              <>
+                <div className="space-y-1.5">
+                  <label className="block text-sm font-medium text-gray-700 dark:text-gray-300">{t('login.token')}</label>
+                  <input
+                    type="password"
+                    value={token}
+                    onChange={(e) => setToken(e.target.value)}
+                    placeholder="mgmt-secret-xxx"
+                    className="w-full px-4 py-2.5 text-sm rounded-xl border border-gray-300 dark:border-gray-700 bg-white dark:bg-gray-800/50 text-gray-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-accent/50 focus:border-accent transition-colors placeholder:text-gray-400"
+                    autoFocus
+                  />
+                </div>
+                <div className="space-y-1.5">
+                  <label className="block text-sm font-medium text-gray-700 dark:text-gray-300">
+                    {t('login.serverUrl')} <span className="text-gray-400 font-normal">({t('common.optional')})</span>
+                  </label>
+                  <input
+                    type="text"
+                    value={serverUrl}
+                    onChange={(e) => setServerUrl(e.target.value)}
+                    placeholder="http://localhost:9820"
+                    className="w-full px-4 py-2.5 text-sm rounded-xl border border-gray-300 dark:border-gray-700 bg-white dark:bg-gray-800/50 text-gray-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-accent/50 focus:border-accent transition-colors placeholder:text-gray-400"
+                  />
+                </div>
+              </>
+            )}
             <button
               type="submit"
-              disabled={loading || !token.trim()}
+              disabled={loading || (mode === 'token' ? !token.trim() : !username.trim() || !password)}
               className="w-full py-2.5 rounded-xl bg-accent text-black font-semibold text-sm hover:bg-accent-dim transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2"
             >
               {loading ? (
@@ -157,7 +224,14 @@ export default function Login() {
               ) : (
                 <Zap size={16} />
               )}
-              {t('login.connect')}
+              {mode === 'token' ? t('login.connect') : t('login.signIn')}
+            </button>
+            <button
+              type="button"
+              onClick={() => { setMode(mode === 'token' ? 'password' : 'token'); setError(''); }}
+              className="w-full text-xs text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-200 transition-colors"
+            >
+              {mode === 'token' ? t('login.usePassword') : t('login.useToken')}
             </button>
           </form>
         </div>

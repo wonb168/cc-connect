@@ -1,3 +1,4 @@
+import { useEffect } from 'react';
 import { Routes, Route, Navigate } from 'react-router-dom';
 import { useAuthStore } from '@/store/auth';
 import Layout from '@/components/Layout/Layout';
@@ -20,6 +21,13 @@ function ProtectedRoute({ children }: { children: React.ReactNode }) {
 
 export default function App() {
   const isAuthenticated = useAuthStore((s) => s.isAuthenticated);
+  const refreshMe = useAuthStore((s) => s.refreshMe);
+
+  // Resolve identity/role after a reload, so the header and write-gating
+  // reflect the logged-in account rather than waiting for the next login.
+  useEffect(() => {
+    if (isAuthenticated) void refreshMe();
+  }, [isAuthenticated, refreshMe]);
 
   return (
     <Routes>

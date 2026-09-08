@@ -2535,6 +2535,100 @@ func TestValidateUsersConfig(t *testing.T) {
 	}
 }
 
+// --- validateManagementConfig tests ---
+
+func TestValidateManagementConfig(t *testing.T) {
+	tests := []struct {
+		name    string
+		mgmt    ManagementConfig
+		wantErr string
+	}{
+		{
+			name:    "no users is valid (legacy token-only setup)",
+			mgmt:    ManagementConfig{Token: "secret"},
+			wantErr: "",
+		},
+		{
+			name: "password user is valid",
+			mgmt: ManagementConfig{Users: []ManagementUser{
+				{Name: "alice", PasswordHash: "$2a$10$abc", Role: "admin"},
+			}},
+			wantErr: "",
+		},
+		{
+			name: "token-only user is valid",
+			mgmt: ManagementConfig{Users: []ManagementUser{
+				{Name: "script", Token: "t0ken"},
+			}},
+			wantErr: "",
+		},
+		{
+			name: "empty name",
+			mgmt: ManagementConfig{Users: []ManagementUser{
+				{Name: "  ", PasswordHash: "$2a$10$abc"},
+			}},
+			wantErr: "empty name",
+		},
+		{
+			name: "duplicate names differing only in case",
+			mgmt: ManagementConfig{Users: []ManagementUser{
+				{Name: "alice", PasswordHash: "$2a$10$abc"},
+				{Name: "ALICE", PasswordHash: "$2a$10$def"},
+			}},
+			wantErr: "duplicate user name",
+		},
+		{
+			name: "no credential",
+			mgmt: ManagementConfig{Users: []ManagementUser{
+				{Name: "alice"},
+			}},
+			wantErr: "needs password_hash or token",
+		},
+		{
+			name: "bad role",
+			mgmt: ManagementConfig{Users: []ManagementUser{
+				{Name: "alice", PasswordHash: "$2a$10$abc", Role: "superuser"},
+			}},
+			wantErr: "role must be",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateManagementConfig(&tt.mgmt)
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Errorf("unexpected error: %v", err)
+				}
+			} else {
+				if err == nil {
+					t.Error("expected error, got nil")
+				} else if !strings.Contains(err.Error(), tt.wantErr) {
+					t.Errorf("error = %q, want substring %q", err.Error(), tt.wantErr)
+				}
+			}
+		})
+	}
+}
+
+func TestManagementUserNormalizedRole(t *testing.T) {
+	tests := []struct {
+		role string
+		want string
+	}{
+		{"", ManagementRoleAdmin},
+		{"admin", ManagementRoleAdmin},
+		{"ADMIN", ManagementRoleAdmin},
+		{"viewer", ManagementRoleViewer},
+		{" Viewer ", ManagementRoleViewer},
+	}
+	for _, tt := range tests {
+		if got := (ManagementUser{Role: tt.role}).NormalizedRole(); got != tt.want {
+			t.Errorf("role %q normalized to %q, want %q", tt.role, got, tt.want)
+		}
+	}
+}
+
 // --- cloneStringMap tests ---
 
 func TestCloneStringMap(t *testing.T) {

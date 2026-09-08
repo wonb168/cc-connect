@@ -65,8 +65,51 @@ token = "mgmt-secret"
 | `enabled`| boolean | `false`   | Enable the Management API server                 |
 | `port`   | integer | `9820`    | TCP port to listen on                            |
 | `token`  | string  | (required)| Shared secret for authentication                 |
+| `users`  | array   | `[]`      | Named accounts (see below); optional             |
+| `session_ttl_mins` | integer | `720` | Login session lifetime in minutes           |
 
 When `enabled` is `false`, the Management API is not started. The token should be a strong, random string (e.g. 32+ characters).
+
+### 2.1.1 Named accounts (optional)
+
+By default the shared `token` is the only credential and every caller has full
+access. Add `[[management.users]]` entries to give people individual logins:
+
+```toml
+[[management.users]]
+name = "alice"
+password_hash = "$2a$10$..."   # bcrypt
+role = "admin"                 # full read/write (default)
+
+[[management.users]]
+name = "bob"
+password_hash = "$2a$10$..."
+role = "viewer"                # read-only: all non-GET requests are rejected
+
+[[management.users]]
+name = "ci-script"
+token = "per-user-api-token"   # for non-interactive clients
+role = "viewer"
+```
+
+Create accounts with the CLI rather than hand-writing hashes:
+
+```bash
+cc-connect web adduser alice                 # prompts for a password
+cc-connect web adduser bob --role viewer
+cc-connect web adduser alice                 # re-run to change a password
+```
+
+| Field           | Type   | Description                                            |
+|-----------------|--------|--------------------------------------------------------|
+| `name`          | string | Login name; case-insensitive, must be unique           |
+| `password_hash` | string | bcrypt hash; required for password login               |
+| `token`         | string | Optional per-user API token (plaintext, for scripts)   |
+| `role`          | string | `admin` (default) or `viewer`                          |
+
+Adding users does **not** disable the shared `token` — it keeps working as a
+legacy admin credential so existing deployments and scripts are unaffected.
+Restart cc-connect after editing accounts.
 
 ### 2.2 Base URL
 
@@ -82,7 +125,8 @@ Example: `http://localhost:9820/api/v1/status`
 
 ## 3. Authentication
 
-Every request must include a valid token. Two methods are supported:
+Every request must carry a credential. Three methods are supported, checked in
+this order: session cookie, per-user token, then the shared token.
 
 ### 3.1 Bearer Token (Recommended)
 
@@ -104,9 +148,65 @@ GET /api/v1/status?token=mgmt-secret
 
 > **Note:** Query parameter auth is provided for environments where setting headers is difficult. Prefer Bearer token for security (tokens in URLs may be logged).
 
-### 3.3 Unauthorized Response
+### 3.3 Password login (named accounts)
 
-If the token is missing or invalid:
+When `[[management.users]]` is configured, clients can exchange a username and
+password for a session cookie.
+
+```
+POST /api/v1/login
+Content-Type: application/json
+
+{"username": "alice", "password": "..."}
+```
+
+On success the response sets an `HttpOnly`, `SameSite=Lax`, HMAC-signed
+`cc_session` cookie and returns the identity:
+
+```json
+{"ok": true, "data": {"name": "alice", "role": "admin"}}
+```
+
+Send that cookie on subsequent requests (browsers do this automatically; with
+`fetch`, set `credentials: 'include'`).
+
+| Endpoint          | Method | Description                                     |
+|-------------------|--------|-------------------------------------------------|
+| `/api/v1/login`   | POST   | Exchange credentials for a session cookie       |
+| `/api/v1/logout`  | POST   | Revoke the current session                      |
+| `/api/v1/me`      | GET    | Current identity, role, and `can_write` flag    |
+
+`GET /api/v1/me` returns:
+
+```json
+{"ok": true, "data": {"name": "alice", "role": "admin", "can_write": true, "auth_mode": "users"}}
+```
+
+`auth_mode` is `users` when named accounts exist and `token` otherwise, so a UI
+can decide whether to show a password form.
+
+Notes:
+
+- Sessions live in memory — restarting cc-connect logs everyone out.
+- Login is rate limited to 10 attempts per minute per client address; exceeding
+  it returns `429 Too Many Requests`.
+- Wrong password and unknown user return the identical error, so the endpoint
+  cannot be used to enumerate account names.
+- `POST /api/v1/login` returns `501 Not Implemented` when no accounts are
+  configured.
+
+### 3.4 Roles
+
+| Role     | Access                                                          |
+|----------|------------------------------------------------------------------|
+| `admin`  | Full read/write. The default when `role` is omitted.             |
+| `viewer` | Read-only. `GET`/`HEAD` allowed; every other method gets `403`.  |
+
+The shared `token` and installs with no accounts are always admin.
+
+### 3.5 Unauthorized Response
+
+If credentials are missing or invalid:
 
 - **HTTP Status:** `401 Unauthorized`
 - **Body:**
@@ -114,7 +214,19 @@ If the token is missing or invalid:
 ```json
 {
   "ok": false,
-  "error": "unauthorized: missing or invalid token"
+  "error": "unauthorized: missing or invalid credentials"
+}
+```
+
+If a `viewer` attempts a write:
+
+- **HTTP Status:** `403 Forbidden`
+- **Body:**
+
+```json
+{
+  "ok": false,
+  "error": "forbidden: read-only user"
 }
 ```
 

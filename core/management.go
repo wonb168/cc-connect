@@ -40,6 +40,7 @@ type ManagementServer struct {
 	corsOrigins []string
 	server      *http.Server
 	startedAt   time.Time
+	auth        *managementAuth
 
 	mu      sync.RWMutex
 	engines map[string]*Engine // project name → engine
@@ -80,6 +81,21 @@ func NewManagementServer(port int, token string, corsOrigins []string) *Manageme
 		corsOrigins: corsOrigins,
 		engines:     make(map[string]*Engine),
 		startedAt:   time.Now(),
+		auth:        newManagementAuth(0),
+	}
+}
+
+// SetManagementUsers installs the named-account table for the web dashboard.
+// Passing an empty slice keeps the single shared-token behaviour.
+func (m *ManagementServer) SetManagementUsers(users []ManagementUserInfo, sessionTTL time.Duration) {
+	if sessionTTL > 0 {
+		m.auth.mu.Lock()
+		m.auth.ttl = sessionTTL
+		m.auth.mu.Unlock()
+	}
+	m.auth.SetUsers(users)
+	if len(users) > 0 {
+		slog.Info("management api: named accounts enabled", "count", len(users))
 	}
 }
 
@@ -145,10 +161,10 @@ type GlobalProviderInfo struct {
 		Model string `json:"model"`
 		Alias string `json:"alias,omitempty"`
 	} `json:"models,omitempty"`
-	Endpoints       map[string]string              `json:"endpoints,omitempty"`
-	AgentModels     map[string]string              `json:"agent_models,omitempty"`
-	AgentModelLists map[string][]GlobalModelEntry   `json:"agent_model_lists,omitempty"`
-	Codex           *GlobalCodexConfig              `json:"codex,omitempty"`
+	Endpoints       map[string]string             `json:"endpoints,omitempty"`
+	AgentModels     map[string]string             `json:"agent_models,omitempty"`
+	AgentModelLists map[string][]GlobalModelEntry `json:"agent_model_lists,omitempty"`
+	Codex           *GlobalCodexConfig            `json:"codex,omitempty"`
 }
 
 // GlobalModelEntry is a model entry inside AgentModelLists.
@@ -213,6 +229,11 @@ func (m *ManagementServer) Start() {
 
 func (m *ManagementServer) buildHandler(mux *http.ServeMux) http.Handler {
 	prefix := "/api/v1"
+
+	// Auth. /login is deliberately not wrapped — callers have no credentials yet.
+	mux.HandleFunc(prefix+"/login", m.handleLogin)
+	mux.HandleFunc(prefix+"/logout", m.handleLogout)
+	mux.HandleFunc(prefix+"/me", m.wrap(m.handleMe))
 
 	// System
 	mux.HandleFunc(prefix+"/status", m.wrap(m.handleStatus))
@@ -305,6 +326,116 @@ func (m *ManagementServer) withStaticFallback(apiMux *http.ServeMux) http.Handle
 	})
 }
 
+// ── Auth endpoints ────────────────────────────────────────────
+
+// handleLogin exchanges a username/password for a session cookie.
+// It is unauthenticated by necessity, so it is rate limited per client address.
+func (m *ManagementServer) handleLogin(w http.ResponseWriter, r *http.Request) {
+	m.setCORS(w, r)
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if r.Method != http.MethodPost {
+		mgmtError(w, http.StatusMethodNotAllowed, "POST only")
+		return
+	}
+	if !m.auth.hasUsers() {
+		mgmtError(w, http.StatusNotImplemented, "no [[management.users]] configured; use token auth")
+		return
+	}
+	if !m.auth.allowLoginAttempt(r) {
+		mgmtError(w, http.StatusTooManyRequests, "too many login attempts; try again later")
+		return
+	}
+
+	var body struct {
+		Username string `json:"username"`
+		Password string `json:"password"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&body); err != nil {
+		mgmtError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+		return
+	}
+
+	p := m.auth.VerifyPassword(body.Username, body.Password)
+	if p == nil {
+		// Same message for unknown user and wrong password — do not disclose
+		// which names exist.
+		slog.Info("management api: login failed", "user", body.Username, "remote", clientIP(r))
+		mgmtError(w, http.StatusUnauthorized, "invalid username or password")
+		return
+	}
+
+	value, expires, err := m.auth.issueSession(*p)
+	if err != nil {
+		mgmtError(w, http.StatusInternalServerError, "issue session: "+err.Error())
+		return
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name:     sessionCookieName,
+		Value:    value,
+		Path:     "/",
+		Expires:  expires,
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		// Secure is not set: the dashboard is commonly served over plain HTTP
+		// on a LAN. Put it behind TLS for anything beyond a trusted network.
+	})
+	slog.Info("management api: login ok", "user", p.Name, "role", p.Role, "remote", clientIP(r))
+	mgmtJSON(w, http.StatusOK, map[string]any{"name": p.Name, "role": p.Role})
+}
+
+// handleLogout revokes the current session. Unwrapped so that logging out with
+// an already-expired cookie still clears it client-side.
+func (m *ManagementServer) handleLogout(w http.ResponseWriter, r *http.Request) {
+	m.setCORS(w, r)
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if r.Method != http.MethodPost {
+		mgmtError(w, http.StatusMethodNotAllowed, "POST only")
+		return
+	}
+	if c, err := r.Cookie(sessionCookieName); err == nil && c.Value != "" {
+		m.auth.revokeSession(c.Value)
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name:     sessionCookieName,
+		Value:    "",
+		Path:     "/",
+		MaxAge:   -1,
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+	})
+	mgmtOK(w, "logged out")
+}
+
+// handleMe reports the caller's identity so the UI can show the current user
+// and hide controls the role cannot use.
+func (m *ManagementServer) handleMe(w http.ResponseWriter, r *http.Request) {
+	p := PrincipalFrom(r.Context())
+	if p == nil {
+		mgmtError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	mgmtJSON(w, http.StatusOK, map[string]any{
+		"name":      p.Name,
+		"role":      p.Role,
+		"can_write": !p.IsViewer(),
+		"auth_mode": m.authMode(),
+	})
+}
+
+// authMode tells the UI whether password login is available.
+func (m *ManagementServer) authMode() string {
+	if m.auth.hasUsers() {
+		return "users"
+	}
+	return "token"
+}
+
 // ── Auth & Middleware ──────────────────────────────────────────
 
 func (m *ManagementServer) wrap(handler http.HandlerFunc) http.HandlerFunc {
@@ -314,27 +445,65 @@ func (m *ManagementServer) wrap(handler http.HandlerFunc) http.HandlerFunc {
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
-		if !m.authenticate(r) {
-			mgmtError(w, http.StatusUnauthorized, "unauthorized: missing or invalid token")
+		p := m.authenticate(r)
+		if p == nil {
+			mgmtError(w, http.StatusUnauthorized, "unauthorized: missing or invalid credentials")
 			return
 		}
-		handler(w, r)
+		// Viewers may read but not mutate. Enforced here rather than per-handler
+		// so a new endpoint is read-only for viewers by default.
+		if p.IsViewer() && r.Method != http.MethodGet && r.Method != http.MethodHead {
+			slog.Info("management api: viewer write blocked",
+				"user", p.Name, "method", r.Method, "path", r.URL.Path)
+			mgmtError(w, http.StatusForbidden, "forbidden: read-only user")
+			return
+		}
+		handler(w, r.WithContext(withPrincipal(r.Context(), p)))
 	}
 }
 
-func (m *ManagementServer) authenticate(r *http.Request) bool {
-	if m.token == "" {
-		return true
+// authenticate resolves the caller's identity, or nil when unauthenticated.
+//
+// Credentials are checked in order: login session cookie, per-user API token,
+// then the legacy shared token. The shared token stays valid even when named
+// accounts exist so that existing deployments and scripts keep working.
+func (m *ManagementServer) authenticate(r *http.Request) *Principal {
+	// Session cookie from POST /login.
+	if c, err := r.Cookie(sessionCookieName); err == nil && c.Value != "" {
+		if p := m.auth.lookupSession(c.Value); p != nil {
+			return p
+		}
 	}
-	// Bearer token
+
+	bearer := ""
 	if auth := r.Header.Get("Authorization"); strings.HasPrefix(auth, "Bearer ") {
-		return subtle.ConstantTimeCompare([]byte(strings.TrimPrefix(auth, "Bearer ")), []byte(m.token)) == 1
+		bearer = strings.TrimPrefix(auth, "Bearer ")
 	}
-	// Query param
-	if t := r.URL.Query().Get("token"); t != "" {
-		return subtle.ConstantTimeCompare([]byte(t), []byte(m.token)) == 1
+	queryTok := r.URL.Query().Get("token")
+
+	// Per-user API tokens.
+	for _, tok := range []string{bearer, queryTok} {
+		if p := m.auth.verifyUserToken(tok); p != nil {
+			return p
+		}
 	}
-	return false
+
+	// Legacy shared token.
+	if m.token == "" {
+		// No shared token configured. Historically this meant "no auth"; that
+		// stays true only while no accounts exist, otherwise an empty token
+		// would silently bypass every account.
+		if !m.auth.hasUsers() {
+			return &Principal{Name: "anonymous", Role: RoleAdmin}
+		}
+		return nil
+	}
+	for _, tok := range []string{bearer, queryTok} {
+		if tok != "" && subtle.ConstantTimeCompare([]byte(tok), []byte(m.token)) == 1 {
+			return &Principal{Name: "legacy-admin", Role: RoleAdmin}
+		}
+	}
+	return nil
 }
 
 func (m *ManagementServer) setCORS(w http.ResponseWriter, r *http.Request) {
@@ -402,9 +571,23 @@ func (m *ManagementServer) handleStatus(w http.ResponseWriter, r *http.Request) 
 	defer m.mu.RUnlock()
 
 	platformSet := make(map[string]bool)
+	var degradedEntries []map[string]any
 	for _, e := range m.engines {
 		for _, p := range e.platforms {
 			platformSet[p.Name()] = true
+			// Issue #1618: surface per-platform degraded state in the
+			// management API so external monitors can alert on it.
+			if ph, ok := p.(PlatformHealth); ok {
+				info := ph.PlatformHealth()
+				if info.Degraded {
+					entry := map[string]any{
+						"name":    info.Name,
+						"reason":  info.DegradedReason,
+						"since":   info.DegradedSince,
+					}
+					degradedEntries = append(degradedEntries, entry)
+				}
+			}
 		}
 	}
 	platforms := make([]string, 0, len(platformSet))
@@ -423,6 +606,7 @@ func (m *ManagementServer) handleStatus(w http.ResponseWriter, r *http.Request) 
 		"connected_platforms": platforms,
 		"projects_count":      len(m.engines),
 		"bridge_adapters":     adapters,
+		"degraded_platforms":  degradedEntries,
 	}
 	if m.bridgeServer != nil {
 		resp["bridge"] = map[string]any{
@@ -640,10 +824,24 @@ func (m *ManagementServer) handleProjectDetail(w http.ResponseWriter, r *http.Re
 	if r.Method == http.MethodGet {
 		platInfos := make([]map[string]any, len(e.platforms))
 		for i, p := range e.platforms {
-			platInfos[i] = map[string]any{
+			entry := map[string]any{
 				"type":      p.Name(),
 				"connected": true,
 			}
+			// Issue #1618: surface per-platform degraded state instead
+			// of a hardcoded "connected": true.
+			if ph, ok := p.(PlatformHealth); ok {
+				info := ph.PlatformHealth()
+				if info.Degraded {
+					entry["connected"] = false
+					entry["degraded"] = true
+					entry["degraded_reason"] = info.DegradedReason
+					if !info.DegradedSince.IsZero() {
+						entry["degraded_since"] = info.DegradedSince
+					}
+				}
+			}
+			platInfos[i] = entry
 		}
 
 		allSessions := e.sessions.AllSessions()
@@ -725,6 +923,14 @@ func (m *ManagementServer) handleProjectDetail(w http.ResponseWriter, r *http.Re
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			mgmtError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
 			return
+		}
+		if body.WorkDir != nil {
+			workDir, err := validateProjectWorkDir(*body.WorkDir)
+			if err != nil {
+				mgmtError(w, http.StatusBadRequest, err.Error())
+				return
+			}
+			*body.WorkDir = workDir
 		}
 
 		if body.Language != nil {
@@ -1905,10 +2111,10 @@ func (m *ManagementServer) handleCCSwitchProviders(w http.ResponseWriter, r *htt
 // applying per-agent-type overrides for base_url, model, and models.
 func resolveGlobalProviderForAgent(g GlobalProviderInfo, agentType string) ProviderConfig {
 	pc := ProviderConfig{
-		Name:   g.Name,
-		APIKey: g.APIKey,
+		Name:    g.Name,
+		APIKey:  g.APIKey,
 		BaseURL: g.BaseURL,
-		Model:  g.Model,
+		Model:   g.Model,
 	}
 	if ep, ok := g.Endpoints[agentType]; ok && ep != "" {
 		pc.BaseURL = ep

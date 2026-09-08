@@ -173,7 +173,15 @@
     "serverUrl": "Server URL",
     "connect": "Connect",
     "invalidToken": "Invalid or expired token",
-    "logout": "Log out"
+    "logout": "Log out",
+    "username": "Username",
+    "password": "Password",
+    "signIn": "Sign in",
+    "invalidCredentials": "Invalid username or password",
+    "useToken": "Use API token instead",
+    "usePassword": "Use username & password",
+    "tooManyAttempts": "Too many attempts. Try again later.",
+    "readOnly": "Read-only"
   },
   "common": {
     "loading": "Loading…",
