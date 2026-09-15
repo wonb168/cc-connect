@@ -117,6 +117,10 @@ type replyContext struct {
 	// archives the file without an agent turn. Zero-value false keeps every
 	// existing call site (and tests) on the normal agent-dispatch path.
 	saveOnly bool
+	// receiptEmoji/receiptMessageID track the persistent reaction owned by the
+	// accepted-message callback so it can be cleared once the agent replies.
+	receiptEmoji     string
+	receiptMessageID string
 }
 
 type Platform struct {
@@ -129,6 +133,7 @@ type Platform struct {
 	useInteractiveCard         bool
 	self                       core.Platform
 	reactionEmoji              string
+	ackEmoji                   string
 	doneEmoji                  string
 	allowFrom                  string
 	allowChat                  string
@@ -371,6 +376,11 @@ func newPlatform(name, domain string, opts map[string]any) (core.Platform, error
 	if v, ok := opts["reaction_emoji"].(string); ok && v == "none" {
 		reactionEmoji = ""
 	}
+	ackEmoji, _ := opts["ack_emoji"].(string)
+	ackEmoji = strings.TrimSpace(ackEmoji)
+	if strings.EqualFold(ackEmoji, "none") {
+		ackEmoji = ""
+	}
 	doneEmoji, _ := opts["done_emoji"].(string)
 	if doneEmoji == "none" {
 		doneEmoji = ""
@@ -507,6 +517,7 @@ func newPlatform(name, domain string, opts map[string]any) (core.Platform, error
 		progressStyle:              progressStyle,
 		useInteractiveCard:         useInteractiveCard,
 		reactionEmoji:              reactionEmoji,
+		ackEmoji:                   ackEmoji,
 		doneEmoji:                  doneEmoji,
 		allowFrom:                  allowFrom,
 		allowChat:                  allowChat,
@@ -1033,10 +1044,14 @@ func (p *Platform) addReaction(messageID string) string {
 }
 
 func (p *Platform) addReactionWithEmoji(messageID, emojiType string) string {
+	return p.addReactionWithEmojiContext(context.Background(), messageID, emojiType)
+}
+
+func (p *Platform) addReactionWithEmojiContext(ctx context.Context, messageID, emojiType string) string {
 	if emojiType == "" {
 		return ""
 	}
-	resp, err := p.client.Im.MessageReaction.Create(context.Background(),
+	resp, err := p.client.Im.MessageReaction.Create(ctx,
 		larkim.NewCreateMessageReactionReqBuilder().
 			MessageId(messageID).
 			Body(larkim.NewCreateMessageReactionReqBodyBuilder().
@@ -1092,6 +1107,12 @@ func (p *Platform) removeReaction(messageID, reactionID string) {
 func (p *Platform) StartTyping(ctx context.Context, rctx any) (stop func()) {
 	rc, ok := rctx.(replyContext)
 	if !ok || rc.messageID == "" {
+		return func() {}
+	}
+	// Feishu identifies a bot's reaction by message and emoji. If receipt and
+	// processing use the same emoji, the persistent receipt owns it: creating
+	// and later deleting a typing reaction would remove the receipt as well.
+	if rc.receiptMessageID == rc.messageID && rc.receiptEmoji != "" && rc.receiptEmoji == p.reactionEmoji {
 		return func() {}
 	}
 	reactionID := p.addReaction(rc.messageID)
@@ -1245,7 +1266,47 @@ func (p *Platform) dispatchCoreMessage(msg *core.Message) {
 		slog.Debug(p.tag()+": recalled message dispatch dropped", "message_id", msg.MessageID)
 		return
 	}
+	p.prepareReceiptAcknowledgement(msg)
 	h(p.dispatchPlatform(), msg)
+}
+
+// prepareReceiptAcknowledgement waits for the engine's admission decision.
+// OnAccepted runs before agent startup or after successful queue insertion;
+// rejected messages and local commands never invoke it. Preserve the existing
+// callback (for example group-history consumption) and keep network IO out of
+// the admission path, which may hold the session queue lock.
+func (p *Platform) prepareReceiptAcknowledgement(msg *core.Message) {
+	rc, ok := msg.ReplyCtx.(replyContext)
+	if p.ackEmoji == "" || !ok || rc.messageID == "" || msg.MessageID == "" || msg.Recalled {
+		return
+	}
+	if rc.receiptEmoji != "" {
+		return // the message already carries this callback
+	}
+	rc.receiptEmoji = p.ackEmoji
+	// Image batches retain the first image's reply context but are admitted
+	// under the newest canonical message ID. Acknowledge that accepted message.
+	rc.receiptMessageID = msg.MessageID
+	msg.ReplyCtx = rc
+	previous := msg.OnAccepted
+	var once sync.Once
+	msg.OnAccepted = func() {
+		once.Do(func() {
+			go func() {
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				if p.isMessageRecalled(rc.receiptMessageID) {
+					return
+				}
+				if p.addReactionWithEmojiContext(ctx, rc.receiptMessageID, rc.receiptEmoji) == "" {
+					slog.Warn(p.tag()+": receipt acknowledgement failed", "message_id", rc.receiptMessageID)
+				}
+			}()
+			if previous != nil {
+				previous()
+			}
+		})
+	}
 }
 
 // populateWorkspaceChannelKeys keeps workspace binding scope aligned with the
