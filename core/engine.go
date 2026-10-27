@@ -427,6 +427,10 @@ type Engine struct {
 	autoCompressEnabled   bool
 	autoCompressMaxTokens int
 	autoCompressMinGap    time.Duration
+	// autoCompressHandoffAfter rotates the conversation to a fresh session
+	// (via a generated handoff document) on the Nth auto-compress instead of
+	// compressing again. 0 = always compress in place.
+	autoCompressHandoffAfter int
 	resetOnIdle           time.Duration
 
 	// Reply footer composition flags. The footer renders up to two lines:
@@ -964,13 +968,20 @@ func estimateTokensWithPendingAssistant(entries []HistoryEntry, pendingAssistant
 }
 
 // SetAutoCompressConfig configures automatic context compression.
-func (e *Engine) SetAutoCompressConfig(enabled bool, maxTokens int, minGap time.Duration) {
+// handoffAfter > 0 rotates the conversation to a fresh session (via a
+// generated handoff document) on the Nth auto-compress instead of
+// compressing again.
+func (e *Engine) SetAutoCompressConfig(enabled bool, maxTokens int, minGap time.Duration, handoffAfter int) {
 	e.autoCompressEnabled = enabled
 	e.autoCompressMaxTokens = maxTokens
 	if minGap <= 0 {
 		minGap = 30 * time.Minute
 	}
 	e.autoCompressMinGap = minGap
+	if handoffAfter < 0 {
+		handoffAfter = 0
+	}
+	e.autoCompressHandoffAfter = handoffAfter
 }
 
 // SetResetOnIdle configures automatic session rotation after prolonged inactivity.
@@ -6370,7 +6381,24 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 					state.lastAutoCompressAt = time.Now()
 					tokenEst := state.lastAutoCompressTokens
 					state.mu.Unlock()
-					slog.Info("auto-compress: triggering", "session", sessionKey)
+
+					// handoff_after: on the Nth auto-compress, hand the
+					// conversation off to a fresh session (handoff document +
+					// /new + injected first prompt) instead of compressing in
+					// place, so long-lived chats never stack compaction on
+					// compaction.
+					count := session.IncrementAutoCompressCount()
+					sessions.Save()
+					if e.autoCompressHandoffAfter > 0 && count >= e.autoCompressHandoffAfter {
+						slog.Info("auto-compress: handoff threshold reached",
+							"session", sessionKey, "count", count,
+							"threshold", e.autoCompressHandoffAfter)
+						e.send(state.platform, state.replyCtx,
+							e.i18n.Tf(MsgAutoHandoffStarting, count))
+						go e.runAutoHandoff(state, session, sessions, sessionKey, state.platform, state.replyCtx)
+						return
+					}
+					slog.Info("auto-compress: triggering", "session", sessionKey, "count", count)
 
 					// Notify user before compressing so they know the context is about to change.
 					compressNotice := e.i18n.T(MsgCompressing)
@@ -11101,6 +11129,232 @@ func (e *Engine) processCompressEvents(state *interactiveState, session *Session
 // drainQueuedMessagesAfterCompress processes any messages that were queued
 // during a /compress operation. It sends each one to the agent and runs the
 // full interactive event loop for it.
+// runAutoHandoff rotates a long-lived conversation to a fresh session on the
+// Nth auto-compress (auto_compress.handoff_after): it asks the current agent
+// session to write a handoff document, starts a new session (same as /new),
+// and injects the document as the first prompt so the next turn continues
+// with full context instead of a twice-compacted summary.
+//
+// Locking mirrors runCompress: the session arrives locked; the deferred
+// unlock covers early-return paths, and the injected turns own their own
+// locking via processInteractiveMessageWith. Runs in its own goroutine —
+// the caller's event loop returns right after spawning it.
+func (e *Engine) runAutoHandoff(state *interactiveState, session *Session, sessions *SessionManager, iKey string, p Platform, replyCtx any) {
+	defer session.Unlock()
+
+	workspaceDir := ""
+	agent := e.agent
+	state.mu.Lock()
+	if state.workspaceDir != "" {
+		workspaceDir = state.workspaceDir
+	}
+	if state.agent != nil {
+		agent = state.agent
+	}
+	// Steal queued messages so cleanupInteractiveState doesn't report them
+	// as dropped — they are replayed onto the fresh session below.
+	queued := state.pendingMessages
+	state.pendingMessages = nil
+	state.mu.Unlock()
+
+	// In single-workspace mode state.workspaceDir is empty for ordinary
+	// platform messages, so fall back to the agent's configured working
+	// directory — the handoff document must live where the fresh session
+	// (which inherits that same work_dir) can read it.
+	if workspaceDir == "" {
+		if wd, ok := agent.(interface{ GetWorkDir() string }); ok {
+			workspaceDir = strings.TrimSpace(wd.GetWorkDir())
+		}
+	}
+	if workspaceDir == "" {
+		workspaceDir, _ = os.Getwd()
+	}
+	if workspaceDir == "" {
+		workspaceDir = os.TempDir()
+	}
+
+	as := state.agentSession
+	if as == nil || !as.Alive() {
+		slog.Warn("auto-handoff: agent session not alive; skipping", "session", iKey)
+		e.reply(p, replyCtx, e.i18n.T(MsgAutoHandoffFailed))
+		return
+	}
+
+	path, err := newHandoffDocPath(workspaceDir, session)
+	if err != nil {
+		slog.Warn("auto-handoff: cannot create handoff document path; skipping",
+			"session", iKey, "error", err)
+		e.reply(p, replyCtx, e.i18n.T(MsgAutoHandoffFailed))
+		return
+	}
+
+	e.stopUnsolicitedReader(state)
+	state.mu.Lock()
+	state.platform = p
+	state.replyCtx = replyCtx
+	state.mu.Unlock()
+	drainEvents(as.Events())
+
+	// Phase 1: ask the current session to write the handoff document.
+	if err := as.Send(autoHandoffDocPrompt(path), "", nil, nil); err != nil {
+		slog.Error("auto-handoff: send failed", "session", iKey, "error", err)
+		e.reply(p, replyCtx, e.i18n.T(MsgAutoHandoffFailed))
+		if !as.Alive() {
+			e.cleanupInteractiveState(iKey, state)
+		}
+		return
+	}
+	if !e.waitHandoffTurn(state) {
+		slog.Error("auto-handoff: handoff turn failed", "session", iKey)
+		e.reply(p, replyCtx, e.i18n.T(MsgAutoHandoffFailed))
+		if !as.Alive() {
+			e.cleanupInteractiveState(iKey, state)
+		}
+		return
+	}
+	if !fileExistsNonEmpty(path) {
+		slog.Error("auto-handoff: handoff document missing after turn",
+			"session", iKey, "path", path)
+		e.reply(p, replyCtx, e.i18n.T(MsgAutoHandoffFailed))
+		return
+	}
+
+	// Phase 2: rotate to a fresh session (the /new path).
+	e.send(p, replyCtx, e.i18n.Tf(MsgAutoHandoffDone, path))
+	e.cleanupInteractiveState(iKey, state)
+	sessions.NewSession(iKey, "")
+
+	// Phase 3: inject the handoff document as the new session's first prompt,
+	// then replay any user messages that arrived during the handoff turn.
+	// iKey was just freed by cleanupInteractiveState, so the injected turn
+	// re-creates the interactive state in the same slot.
+	newSession := sessions.GetOrCreateActive(iKey)
+	inject := &Message{
+		SessionKey: iKey,
+		Platform:   p.Name(),
+		UserID:     extractUserID(iKey),
+		Content:    autoHandoffInjectPrompt(path),
+		ReplyCtx:   replyCtx,
+	}
+	e.processInteractiveMessageWith(p, inject, newSession, agent, sessions, iKey, workspaceDir, iKey)
+
+	for _, q := range queued {
+		m := &Message{
+			SessionKey:        iKey,
+			Platform:          q.platform.Name(),
+			ReplyCtx:          q.replyCtx,
+			Content:           q.content,
+			Images:            q.images,
+			Files:             q.files,
+			FromVoice:         q.fromVoice,
+			UserID:            q.userID,
+			UserName:          q.userName,
+			ChannelKey:        q.channelKey,
+			UserMessageTimeMs: q.userMessageTimeMs,
+		}
+		e.processInteractiveMessageWith(q.platform, m, newSession, agent, sessions, iKey, workspaceDir, iKey)
+	}
+}
+
+// waitHandoffTurn waits for the handoff prompt's turn to finish. Unlike
+// processCompressEvents it never streams output to the user and has no
+// queued-message replay; it only reports whether the turn ended cleanly.
+func (e *Engine) waitHandoffTurn(state *interactiveState) bool {
+	if state.agentSession == nil {
+		return false
+	}
+	events := state.agentSession.Events()
+	stopCh := state.stopSignal()
+	var idleCh <-chan time.Time
+	if e.eventIdleTimeout > 0 {
+		timer := time.NewTimer(e.eventIdleTimeout)
+		defer timer.Stop()
+		idleCh = timer.C
+	}
+	for {
+		var event Event
+		select {
+		case <-stopCh:
+			return false
+		case event, _ = <-events:
+		case <-idleCh:
+			return false
+		case <-e.ctx.Done():
+			return false
+		}
+
+		switch event.Type {
+		case EventResult:
+			if event.Done {
+				return true
+			}
+			// Mid-turn compaction inside the handoff turn — keep waiting.
+		case EventError:
+			return false
+		case EventPermissionRequest:
+			// Match runCompress: auto-approve so the handoff turn cannot
+			// stall behind a permission prompt.
+			_ = state.agentSession.RespondPermission(event.RequestID, PermissionResult{
+				Behavior:     "allow",
+				UpdatedInput: event.ToolInputRaw,
+			})
+		}
+	}
+}
+
+// newHandoffDocPath builds the handoff document path under
+// <workspace>/handoff/ and creates the directory. The filename carries a
+// timestamp plus the current agent session id so successive handoffs never
+// overwrite each other.
+func newHandoffDocPath(workspaceDir string, session *Session) (string, error) {
+	if strings.TrimSpace(workspaceDir) == "" {
+		return "", fmt.Errorf("workspace dir unknown")
+	}
+	dir := filepath.Join(workspaceDir, "handoff")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", fmt.Errorf("create handoff dir: %w", err)
+	}
+	sid := session.GetAgentSessionID()
+	if sid == "" || sid == ContinueSession {
+		sid = session.ID
+	}
+	sid = strings.Map(func(r rune) rune {
+		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '-' || r == '_' {
+			return r
+		}
+		return '-'
+	}, sid)
+	if len(sid) > 8 {
+		sid = sid[:8]
+	}
+	return filepath.Join(dir, fmt.Sprintf("%s-%s.md", time.Now().Format("20060102-150405"), sid)), nil
+}
+
+// autoHandoffDocPrompt asks the current agent session to write a handoff
+// document covering everything a fresh session needs to continue the work.
+// Deliberately agent-agnostic: agents with a handoff skill will recognise the
+// intent; others follow the literal instructions.
+func autoHandoffDocPrompt(path string) string {
+	return "Write a handoff document for this conversation to the file: " + path + "\n" +
+		"Requirements:\n" +
+		"- Markdown with sections: Goal & Background, Completed Work (with key file paths and commands), Pending Work, Next Steps, Caveats\n" +
+		"- Only write the document; do not continue executing any task\n" +
+		"- When done, reply with a single line confirming the document has been written\n"
+}
+
+// autoHandoffInjectPrompt is the fresh session's first prompt: read the
+// handoff document and confirm understanding without starting work.
+func autoHandoffInjectPrompt(path string) string {
+	return "A previous session handed off to you. Read the handoff document at " + path +
+		", then confirm in at most three sentences: current state and next step. Do not start executing any task yet."
+}
+
+// fileExistsNonEmpty reports whether path exists as a non-empty file.
+func fileExistsNonEmpty(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && !info.IsDir() && info.Size() > 0
+}
+
 func (e *Engine) drainQueuedMessagesAfterCompress(state *interactiveState, session *Session, sessions *SessionManager, sessionKey string, unlocked *bool) {
 	if e.drainPendingMessages(state, session, sessions, sessionKey) {
 		*unlocked = true

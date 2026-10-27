@@ -38,6 +38,7 @@ type claudeSession struct {
 	acceptEditsOnly atomic.Bool
 	dontAsk         atomic.Bool
 	workDir         string
+	costCfg         costConfig // reply-footer cost source and token prices
 	ctx             context.Context
 	cancel          context.CancelFunc
 	done            chan struct{}
@@ -401,7 +402,7 @@ func buildAppendSystemPrompt(agentPrompt, platformPrompt, userAppend string) str
 	return strings.Join(parts, "\n")
 }
 
-func newClaudeSession(ctx context.Context, workDir, cliBin string, cliExtraArgs []string, cmdArgsFlag string, model, effort, sessionID, mode, systemPrompt, appendSystemPrompt string, allowedTools, disallowedTools []string, pluginDirs []string, extraEnv []string, platformPrompt string, disableVerbose bool, spawnOpts core.SpawnOptions, maxContextTokens int, ccDataDir string, lang core.Language) (*claudeSession, error) {
+func newClaudeSession(ctx context.Context, workDir, cliBin string, cliExtraArgs []string, cmdArgsFlag string, model, effort, sessionID, mode, systemPrompt, appendSystemPrompt string, allowedTools, disallowedTools []string, pluginDirs []string, extraEnv []string, platformPrompt string, disableVerbose bool, spawnOpts core.SpawnOptions, maxContextTokens int, ccDataDir string, lang core.Language, costCfg costConfig) (*claudeSession, error) {
 	sessionCtx, cancel := context.WithCancel(ctx)
 
 	// Claude Code rejects bypassPermissions when running as root.
@@ -663,11 +664,16 @@ func newClaudeSession(ctx context.Context, workDir, cliBin string, cliExtraArgs 
 		cleanupPromptPath = promptFilePath
 	}
 
+	if costCfg.source == "" {
+		costCfg = defaultCostConfig()
+	}
+
 	cs := &claudeSession{
 		cmd:                 cmd,
 		stdin:               stdin,
 		events:              make(chan core.Event, 64),
 		workDir:             workDir,
+		costCfg:             costCfg,
 		ctx:                 sessionCtx,
 		cancel:              cancel,
 		done:                make(chan struct{}),
@@ -1051,41 +1057,75 @@ func (cs *claudeSession) handleResult(raw map[string]any) {
 		inputTokens, outputTokens, cacheCreationTokens, cacheReadTokens = parseClaudeUsage(usage)
 	}
 
-	// total_cost_usd is the CLI's authoritative billing figure (already accounts
-	// for cache-write / cache-read price tiers), and it is CUMULATIVE for the
-	// whole CLI session — each result event reports the running total, not the
-	// cost of that turn alone. The per-turn figure is therefore the rise since
-	// the previous completed turn (costBaselineUSD). Both are surfaced: the
-	// delta for "what did this turn cost", the total for "what has this session
-	// cost so far". A missing/zero value means "cost unknown" (e.g. a relay
-	// provider that does not report billing) — we never estimate it from token
-	// counts.
-	var sessionCostUSD float64
-	if v, ok := raw["total_cost_usd"].(float64); ok {
-		sessionCostUSD = v
-	}
-
-	var turnCostUSD float64
+	// Cost depends on the configured source (see cost.go):
+	//
+	//   cli    — total_cost_usd is the CLI's own billing figure, CUMULATIVE for
+	//            the whole CLI session; the turn cost is the rise since the
+	//            previous completed turn (costBaselineUSD). Only meaningful when
+	//            the upstream is billed with the Anthropic price table.
+	//   tokens — ignore total_cost_usd and price this event's token usage with
+	//            the configured per-model prices. This is the correct mode
+	//            behind a relay/router that routes to third-party models.
+	//   none   — report no cost at all.
+	//
+	// A zero figure always means "cost unknown" downstream; the footer then
+	// omits the segment.
+	var sessionCostUSD, turnCostUSD float64
 	cs.usageMu.Lock()
 	if outputTokens > 0 && cs.lastUsage != nil {
 		cs.lastUsage.OutputTokens = outputTokens
 		cs.lastUsage.TotalTokens = cs.lastUsage.UsedTokens + outputTokens
 	}
-	if sessionCostUSD > 0 {
-		cs.sessionCostUSD = sessionCostUSD
-		// A total below the baseline means the CLI restarted its counter
-		// (e.g. --resume into a fresh process); treat the reported total as
-		// the turn's own cost and re-baseline rather than emitting a negative.
-		if sessionCostUSD >= cs.costBaselineUSD {
-			turnCostUSD = sessionCostUSD - cs.costBaselineUSD
-		} else {
-			turnCostUSD = sessionCostUSD
+	switch cs.costCfg.source {
+	case costSourceNone:
+		// Cost reporting disabled: the zero values make the footer omit the
+		// cost segment and mark the recorder's cost as unknown.
+	case costSourceTokens:
+		// Price the CLI-reported token counts ourselves. For third-party
+		// models total_cost_usd is ignored: behind a router it is priced with
+		// the CLI's Anthropic table and badly overstates the real cost.
+		turnCostUSD = cs.costCfg.turnCostUSD(raw, cs.GetModel())
+		// Unpriced models (typically real Anthropic ones such as
+		// claude-sonnet-5-5) fall back to the CLI's own per-turn delta, which
+		// is accurate for Anthropic billing. Keeping costBaselineUSD current
+		// in this mode makes that delta correct.
+		if cliTotal, ok := raw["total_cost_usd"].(float64); ok && cliTotal > 0 {
+			if turnCostUSD <= 0 {
+				if cliTotal >= cs.costBaselineUSD {
+					turnCostUSD = cliTotal - cs.costBaselineUSD
+				} else {
+					turnCostUSD = cliTotal
+				}
+			}
+			cs.costBaselineUSD = cliTotal
 		}
-		if !isCompaction {
-			// Only a completed turn advances the baseline. A mid-turn
-			// compaction's cost stays inside the turn that triggered it.
-			cs.costBaselineUSD = sessionCostUSD
-			cs.lastTurnCostUSD = turnCostUSD
+		if turnCostUSD > 0 {
+			cs.sessionCostUSD += turnCostUSD
+			sessionCostUSD = cs.sessionCostUSD
+			if !isCompaction {
+				cs.lastTurnCostUSD = turnCostUSD
+			}
+		}
+	default:
+		if v, ok := raw["total_cost_usd"].(float64); ok {
+			sessionCostUSD = v
+		}
+		if sessionCostUSD > 0 {
+			cs.sessionCostUSD = sessionCostUSD
+			// A total below the baseline means the CLI restarted its counter
+			// (e.g. --resume into a fresh process); treat the reported total as
+			// the turn's own cost and re-baseline rather than emitting a negative.
+			if sessionCostUSD >= cs.costBaselineUSD {
+				turnCostUSD = sessionCostUSD - cs.costBaselineUSD
+			} else {
+				turnCostUSD = sessionCostUSD
+			}
+			if !isCompaction {
+				// Only a completed turn advances the baseline. A mid-turn
+				// compaction's cost stays inside the turn that triggered it.
+				cs.costBaselineUSD = sessionCostUSD
+				cs.lastTurnCostUSD = turnCostUSD
+			}
 		}
 	}
 	cs.usageMu.Unlock()

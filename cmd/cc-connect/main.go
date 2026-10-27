@@ -699,17 +699,7 @@ func main() {
 		}
 
 		// Wire auto-compress settings
-		if proj.AutoCompress.Enabled != nil && *proj.AutoCompress.Enabled {
-			minGap := 30 * time.Minute
-			if proj.AutoCompress.MinGapMins != nil {
-				minGap = time.Duration(*proj.AutoCompress.MinGapMins) * time.Minute
-			}
-			maxTokens := derefInt(proj.AutoCompress.MaxTokens)
-			if maxTokens <= 0 {
-				maxTokens = 12000
-			}
-			engine.SetAutoCompressConfig(true, maxTokens, minGap)
-		}
+		applyAutoCompressConfig(engine, &proj)
 		resetIdle, defaulted := resolveResetOnIdle(proj.ResetOnIdleMins)
 		engine.SetResetOnIdle(resetIdle)
 		if defaulted {
@@ -1797,19 +1787,7 @@ func reloadConfig(configPath, projName string, engine *core.Engine) (*core.Confi
 	engine.SetUsageRecorderEndpoint(config.EffectiveUsageRecorderEndpoint(cfg, proj))
 
 	// Reload auto-compress settings
-	if proj.AutoCompress.Enabled != nil && *proj.AutoCompress.Enabled {
-		minGap := 30 * time.Minute
-		if proj.AutoCompress.MinGapMins != nil {
-			minGap = time.Duration(*proj.AutoCompress.MinGapMins) * time.Minute
-		}
-		maxTokens := derefInt(proj.AutoCompress.MaxTokens)
-		if maxTokens <= 0 {
-			maxTokens = 12000
-		}
-		engine.SetAutoCompressConfig(true, maxTokens, minGap)
-	} else {
-		engine.SetAutoCompressConfig(false, 0, 0)
-	}
+	applyAutoCompressConfig(engine, proj)
 	resetIdle, defaulted := resolveResetOnIdle(proj.ResetOnIdleMins)
 	engine.SetResetOnIdle(resetIdle)
 	if defaulted {
@@ -1952,6 +1930,34 @@ func convertProviderModels(ms []config.ProviderModelConfig) []core.ModelOption {
 	return opts
 }
 
+// applyAutoCompressConfig wires [projects.auto_compress] into the engine.
+// Shared by startup and config reload so both paths stay in sync.
+// Defaults when enabled: max_tokens 150000, min_gap_mins 30, handoff_after 3
+// (the 3rd auto-compress rotates the chat to a fresh session via a generated
+// handoff document; 0 disables the rotation).
+func applyAutoCompressConfig(engine *core.Engine, proj *config.ProjectConfig) {
+	if proj.AutoCompress.Enabled == nil || !*proj.AutoCompress.Enabled {
+		engine.SetAutoCompressConfig(false, 0, 0, 0)
+		return
+	}
+	minGap := 30 * time.Minute
+	if proj.AutoCompress.MinGapMins != nil {
+		minGap = time.Duration(*proj.AutoCompress.MinGapMins) * time.Minute
+	}
+	maxTokens := derefInt(proj.AutoCompress.MaxTokens)
+	if maxTokens <= 0 {
+		maxTokens = 150000
+	}
+	handoffAfter := 3
+	if proj.AutoCompress.HandoffAfter != nil {
+		handoffAfter = *proj.AutoCompress.HandoffAfter
+		if handoffAfter < 0 {
+			handoffAfter = 0
+		}
+	}
+	engine.SetAutoCompressConfig(true, maxTokens, minGap, handoffAfter)
+}
+
 func buildAgentOptions(dataDir string, proj config.ProjectConfig) map[string]any {
 	opts := make(map[string]any, len(proj.Agent.Options)+2)
 	for k, v := range proj.Agent.Options {
@@ -1959,6 +1965,11 @@ func buildAgentOptions(dataDir string, proj config.ProjectConfig) map[string]any
 	}
 	opts["cc_data_dir"] = dataDir
 	opts["cc_project"] = proj.Name
+	if config.ConfigPath != "" {
+		// Expose the config's directory so per-project file options (e.g. the
+		// claudecode cost price CSV) can be resolved relative to the .toml.
+		opts["cc_config_dir"] = filepath.Dir(config.ConfigPath)
+	}
 	return opts
 }
 

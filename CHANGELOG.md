@@ -1,5 +1,20 @@
 # Changelog
 
+## v1.5.1-wcz.2 (2026-10-27)
+
+本地分支定制版本：Claude Code 费用改为可配置单价表计算，自动压缩支持交接轮换（auto-handoff）。
+
+### New Features
+- **Claude Code 本地费用计算**（`agent/claudecode/cost.go`）：新增 `[projects.agent.options.cost]` 配置。`source = "tokens"` 时按每次结果事件的 `modelUsage` token 明细 × 单价表计算费用，忽略 CLI 返回的 `total_cost_usd`（经 OmniRoute 等网关转发时该值会按 Anthropic 价目表高估）；未配单价的模型回退到 CLI 的 `total_cost_usd` 增量。`source = "cli"`（默认）保持原行为，`none` 关闭费用。
+- **单价表支持 CSV**：`prices_file` 相对配置文件目录解析（也可写绝对路径），列 `model,input,output,cache_read,cache_creation,currency,rate`；表头可选。`currency = CNY/RMB` 时按 `rate`（默认 6）换算为 USD，`USD` 汇率 1。内置 DeepSeek 全系、GLM、Claude Sonnet 5.5 等价格兜底，支持 `*` 通配条目前缀匹配（如 `bigmodel/glm-5.3`）。
+- **自动交接 auto-handoff**：`[projects.auto_compress]` 新增 `handoff_after`。引擎第 N 次自动压缩时不再原地压缩，而是让当前会话生成交接文档（`<工作区>/handoff/<时间戳>-<会话ID>.md`）→ 开新会话 → 把文档路径作为首条消息注入 → 重放交接期间排队的用户消息。交接失败自动降级为保留原会话并提示，不丢消息。
+
+### Fixed
+- **auto-compress 计数持久化**：`Session.AutoCompressCount` 之前未写入 sessions.json 快照，进程重启后清零；现已持久化。
+- **auto-handoff 工作目录回退**：单工作区模式下普通消息/定时任务的 `interactiveState.workspaceDir` 为空，导致交接文档无法创建（`workspace dir unknown`）。现在依次回退到 `agent.GetWorkDir()` → 进程 cwd → 临时目录。
+- **钉钉 SDK**：`dingtalk-stream-sdk-go` 升级到 `v0.9.2-beta.1`，修复 `send on closed channel` panic（client.go:161）。
+
+
 ## v1.5.1-beta.1 (2026-08-28)
 
 Beta since v1.5.0 stable — 16 merged PRs focused on Feishu/Weixin reliability, Claude Code /compact, Codex reasoning, and Cursor image attachments. See `changelogs/v1.5.1-beta.1.md` for the full contributor list.

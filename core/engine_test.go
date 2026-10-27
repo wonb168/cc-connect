@@ -8558,6 +8558,10 @@ type queuingAgentSession struct {
 	controllableAgentSession
 	sendCalls []string
 	sendMu    sync.Mutex
+	// sendHook, when set, runs on every Send with the prompt (after the call
+	// is recorded). Tests use it to emulate the agent acting on a prompt,
+	// e.g. writing the handoff document named in it.
+	sendHook func(prompt string)
 }
 
 func newQueuingSession(id string) *queuingAgentSession {
@@ -8574,8 +8578,19 @@ func newQueuingSession(id string) *queuingAgentSession {
 func (s *queuingAgentSession) Send(prompt string, _ string, _ []ImageAttachment, _ []FileAttachment) error {
 	s.sendMu.Lock()
 	s.sendCalls = append(s.sendCalls, prompt)
+	hook := s.sendHook
 	s.sendMu.Unlock()
+	if hook != nil {
+		hook(prompt)
+	}
 	return nil
+}
+
+// clearSends drops the recorded Send calls.
+func (s *queuingAgentSession) clearSends() {
+	s.sendMu.Lock()
+	s.sendCalls = nil
+	s.sendMu.Unlock()
 }
 
 // blockingSendAgentSession blocks in Send until unblock is closed, mimicking agents
@@ -9845,6 +9860,16 @@ type stubCompressorAgent struct {
 
 func (a *stubCompressorAgent) CompressCommand() string { return a.cmd }
 
+// workDirCompressorAgent exposes GetWorkDir so tests can exercise the
+// auto-handoff workspace fallback (single-workspace mode passes no
+// workspaceDir through the message path).
+type workDirCompressorAgent struct {
+	stubCompressorAgent
+	workDir string
+}
+
+func (a *workDirCompressorAgent) GetWorkDir() string { return a.workDir }
+
 func TestCmdCompress_NoCompressor_RepliesNotSupported(t *testing.T) {
 	p := &stubPlatformEngine{n: "test"}
 	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
@@ -9883,7 +9908,7 @@ func TestAutoCompress_TriggerAfterResult(t *testing.T) {
 	sess := newQueuingSession("auto-compress")
 	agent := &stubCompressorAgent{cmd: "/compact"}
 	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
-	e.SetAutoCompressConfig(true, 4, 0) // tiny threshold
+	e.SetAutoCompressConfig(true, 4, 0, 0) // tiny threshold
 
 	key := "test:user1"
 	state := &interactiveState{
@@ -9929,6 +9954,290 @@ func TestAutoCompress_TriggerAfterResult(t *testing.T) {
 	}
 }
 
+// TestAutoCompress_HandoffAfterN verifies the handoff_after rotation: the 1st
+// auto-compress still compresses in place, the Nth generates a handoff
+// document, rotates to a fresh session and injects the document as the first
+// prompt. The counter resets with the new session.
+func TestAutoCompress_HandoffAfterN(t *testing.T) {
+	tmpDir := t.TempDir()
+	p := &stubPlatformEngine{n: "test"}
+	sess := newQueuingSession("auto-handoff")
+	sess.sendHook = func(prompt string) {
+		// Emulate the agent writing the handoff document named in the prompt.
+		if strings.Contains(prompt, "handoff document") {
+			const marker = "file: "
+			if i := strings.Index(prompt, marker); i >= 0 {
+				path := strings.TrimSpace(prompt[i+len(marker):])
+				path = strings.SplitN(path, "\n", 2)[0]
+				_ = os.WriteFile(path, []byte("# handoff"), 0o644)
+			}
+		}
+	}
+	agent := &stubCompressorAgent{cmd: "/compact"}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+	// minGap must be non-zero (0 is clamped to the 30-minute default, which
+	// would suppress the second trigger) — 1ms lets both turns fire back-to-back.
+	e.SetAutoCompressConfig(true, 4, time.Millisecond, 2)
+
+	key := "test:user1"
+	state := &interactiveState{
+		agentSession: sess,
+		platform:     p,
+		replyCtx:     "ctx",
+		workspaceDir: tmpDir,
+		agent:        agent,
+	}
+	e.interactiveMu.Lock()
+	e.interactiveStates[key] = state
+	e.interactiveMu.Unlock()
+
+	session := e.sessions.GetOrCreateActive(key)
+	session.AddHistory("user", "hello world")
+
+	waitSend := func() string {
+		deadline := time.After(3 * time.Second)
+		for {
+			sess.sendMu.Lock()
+			n := len(sess.sendCalls)
+			sess.sendMu.Unlock()
+			if n > 0 {
+				sess.sendMu.Lock()
+				last := sess.sendCalls[len(sess.sendCalls)-1]
+				sess.sendMu.Unlock()
+				return last
+			}
+			select {
+			case <-deadline:
+				t.Fatal("timed out waiting for agent send")
+			default:
+				time.Sleep(10 * time.Millisecond)
+			}
+		}
+	}
+
+	// Turn 1: crosses the threshold — must compress in place (count=1 < 2).
+	// The in-place /compact runs inside processCompressEvents, so the turn's
+	// Done event is followed by a second Done event closing the compress turn.
+	go e.processInteractiveEvents(state, session, e.sessions, key, "msg1", time.Now(), func() {}, nil, nil)
+	sess.events <- Event{Type: EventResult, Content: "response", Done: true}
+	if got := waitSend(); got != "/compact" {
+		t.Fatalf("turn 1: expected in-place /compact, got %q", got)
+	}
+	sess.events <- Event{Type: EventResult, Content: "compacted", Done: true}
+	if got := session.AutoCompressCount; got != 1 {
+		t.Fatalf("turn 1: AutoCompressCount = %d, want 1", got)
+	}
+
+	// Wait until the turn-1 event loop has fully returned and released the
+	// session lock before starting turn 2.
+	deadline := time.After(3 * time.Second)
+	for session.TryLock() == false {
+		select {
+		case <-deadline:
+			t.Fatal("timed out waiting for turn 1 to release session lock")
+		default:
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	session.Unlock()
+
+	// Turn 2: second trigger — must hand off instead of compressing.
+	// The injection prompt on the fresh session also produces a Done event.
+	sess.clearSends()
+	go e.processInteractiveEvents(state, session, e.sessions, key, "msg2", time.Now(), func() {}, nil, nil)
+	sess.events <- Event{Type: EventResult, Content: "response 2", Done: true}
+	got := waitSend()
+	if !strings.Contains(got, "handoff document") {
+		t.Fatalf("turn 2: expected handoff prompt, got %q", got)
+	}
+	// The handoff doc prompt turn must also complete for rotation to proceed.
+	sess.events <- Event{Type: EventResult, Content: "handoff written", Done: true}
+
+	// Wait for the rotation to complete: the fresh session's history records
+	// the injected handoff prompt as its first user message.
+	deadline = time.After(5 * time.Second)
+	for {
+		injected := false
+		for _, h := range e.sessions.GetOrCreateActive(key).GetHistory(0) {
+			if strings.Contains(h.Content, "Read the handoff document") {
+				injected = true
+			}
+		}
+		if injected {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("handoff rotation incomplete: injected prompt never reached the fresh session; sent=%v",
+				p.getSent())
+		default:
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+
+	fresh := e.sessions.GetOrCreateActive(key)
+	if got := fresh.AutoCompressCount; got != 0 {
+		t.Fatalf("fresh session AutoCompressCount = %d, want 0", got)
+	}
+}
+
+// TestAutoCompress_HandoffAfterDisabled verifies handoff_after = 0 keeps the
+// legacy behavior: every trigger compresses in place, never rotates.
+func TestAutoCompress_HandoffAfterDisabled(t *testing.T) {
+	p := &stubPlatformEngine{n: "test"}
+	sess := newQueuingSession("auto-handoff-off")
+	agent := &stubCompressorAgent{cmd: "/compact"}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+	e.SetAutoCompressConfig(true, 4, 0, 0)
+
+	key := "test:user1"
+	state := &interactiveState{
+		agentSession: sess,
+		platform:     p,
+		replyCtx:     "ctx",
+		workspaceDir: t.TempDir(),
+		agent:        agent,
+	}
+	e.interactiveMu.Lock()
+	e.interactiveStates[key] = state
+	e.interactiveMu.Unlock()
+
+	session := e.sessions.GetOrCreateActive(key)
+	session.AddHistory("user", "hello world")
+
+	go e.processInteractiveEvents(state, session, e.sessions, key, "msg1", time.Now(), func() {}, nil, nil)
+	sess.events <- Event{Type: EventResult, Content: "response", Done: true}
+
+	deadline := time.After(3 * time.Second)
+	for {
+		sess.sendMu.Lock()
+		calls := append([]string(nil), sess.sendCalls...)
+		sess.sendMu.Unlock()
+		counted := false
+		for _, c := range calls {
+			if c == "/compact" {
+				counted = true
+			}
+			if strings.Contains(c, "handoff document") {
+				t.Fatalf("handoff_after=0 must never hand off, got %q", c)
+			}
+		}
+		if counted {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("timed out waiting for in-place compress")
+		default:
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+}
+
+// TestAutoCompress_HandoffFallsBackToAgentWorkDir covers the single-workspace
+// case where the interactive state has no workspaceDir (ordinary platform
+// messages, cron turns): the handoff document must still be created, under
+// the agent's configured working directory.
+func TestAutoCompress_HandoffFallsBackToAgentWorkDir(t *testing.T) {
+	dir := t.TempDir()
+	p := &stubPlatformEngine{n: "test"}
+	sess := newQueuingSession("auto-handoff-workdir")
+	sess.sendHook = func(prompt string) {
+		if strings.Contains(prompt, "handoff document") {
+			if i := strings.Index(prompt, "file: "); i >= 0 {
+				path := strings.SplitN(strings.TrimSpace(prompt[i+6:]), "\n", 2)[0]
+				_ = os.WriteFile(path, []byte("# handoff"), 0o644)
+			}
+		}
+	}
+	agent := &workDirCompressorAgent{
+		stubCompressorAgent: stubCompressorAgent{cmd: "/compact"},
+		workDir:             dir,
+	}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+	e.SetAutoCompressConfig(true, 4, time.Millisecond, 1)
+
+	key := "test:user1"
+	state := &interactiveState{
+		agentSession: sess,
+		platform:     p,
+		replyCtx:     "ctx",
+		agent:        agent,
+		// workspaceDir intentionally empty — single-workspace mode.
+	}
+	e.interactiveMu.Lock()
+	e.interactiveStates[key] = state
+	e.interactiveMu.Unlock()
+
+	session := e.sessions.GetOrCreateActive(key)
+	session.AddHistory("user", "hello world")
+
+	go e.processInteractiveEvents(state, session, e.sessions, key, "msg1", time.Now(), func() {}, nil, nil)
+	sess.events <- Event{Type: EventResult, Content: "response", Done: true}
+
+	// The handoff prompt is the first send (threshold = 1); complete its turn.
+	deadline := time.After(3 * time.Second)
+	for {
+		sess.sendMu.Lock()
+		n := len(sess.sendCalls)
+		sess.sendMu.Unlock()
+		if n > 0 {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("timed out waiting for handoff prompt")
+		default:
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	sess.sendMu.Lock()
+	first := sess.sendCalls[0]
+	sess.sendMu.Unlock()
+	if !strings.Contains(first, "handoff document") {
+		t.Fatalf("expected handoff prompt, got %q", first)
+	}
+	sess.events <- Event{Type: EventResult, Content: "handoff written", Done: true}
+
+	// Document must land under the agent's work dir.
+	deadline = time.After(5 * time.Second)
+	for {
+		matches, _ := filepath.Glob(filepath.Join(dir, "handoff", "*.md"))
+		if len(matches) > 0 {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("handoff document not created under %s", filepath.Join(dir, "handoff"))
+		default:
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+}
+
+// TestSessionAutoCompressCountPersists pins the snapshot round-trip of the
+// auto-compress counter.
+func TestSessionAutoCompressCountPersists(t *testing.T) {
+	dir := t.TempDir()
+	sm := NewSessionManager(filepath.Join(dir, "sessions.json"))
+
+	s := sm.GetOrCreateActive("test:u1")
+	if got := s.IncrementAutoCompressCount(); got != 1 {
+		t.Fatalf("first increment = %d, want 1", got)
+	}
+	if got := s.IncrementAutoCompressCount(); got != 2 {
+		t.Fatalf("second increment = %d, want 2", got)
+	}
+	sm.Save()
+
+	sm2 := NewSessionManager(filepath.Join(dir, "sessions.json"))
+	sm2.load()
+	s2 := sm2.GetOrCreateActive("test:u1")
+	if got := s2.AutoCompressCount; got != 2 {
+		t.Fatalf("after reload AutoCompressCount = %d, want 2", got)
+	}
+}
+
 // TestAutoCompress_UsesRealUsageWhenAvailable verifies that when the agent session
 // implements ContextUsageReporter and reports a real API token count, the auto-compress
 // trigger uses that real number instead of the text-only heuristic — even when the
@@ -9942,7 +10251,7 @@ func TestAutoCompress_UsesRealUsageWhenAvailable(t *testing.T) {
 	// Heuristic threshold of 4 tokens would NOT trigger on a short message,
 	// but the real usage of 50_000 tokens (representing tool_use/tool_result overhead)
 	// MUST trigger.
-	e.SetAutoCompressConfig(true, 4, 0)
+	e.SetAutoCompressConfig(true, 4, 0, 0)
 
 	key := "test:user1"
 	state := &interactiveState{
@@ -10000,7 +10309,7 @@ func TestAutoCompress_FallsBackToHeuristicWhenNoUsage(t *testing.T) {
 	sess := newQueuingSession("no-usage")
 	agent := &stubCompressorAgent{cmd: "/compact"}
 	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
-	e.SetAutoCompressConfig(true, 4, 0)
+	e.SetAutoCompressConfig(true, 4, 0, 0)
 
 	key := "test:user1"
 	state := &interactiveState{

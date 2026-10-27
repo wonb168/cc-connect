@@ -45,7 +45,8 @@ type Agent struct {
 	mode             string // "default" | "acceptEdits" | "plan" | "auto" | "bypassPermissions" | "dontAsk"
 	allowedTools     []string
 	disallowedTools  []string
-	maxContextTokens int // optional: passed as --max-context-tokens when > 0
+	maxContextTokens int        // optional: passed as --max-context-tokens when > 0
+	costCfg          costConfig // how the reply-footer cost is derived
 	providers        []core.ProviderConfig
 	activeIdx        int // -1 = no provider set
 	sessionEnv       []string
@@ -266,6 +267,14 @@ func New(opts map[string]any) (core.Agent, error) {
 		slog.Warn("claudecode: failed to write shared system prompt file at startup; will retry on first spawn", "err", err, "cc_data_dir", ccDataDir)
 	}
 
+	costCfg := parseCostConfig(opts)
+	if costCfg.source != costSourceCLI {
+		slog.Info("claudecode: reply-footer cost source configured",
+			"source", costCfg.source,
+			"default_model", costCfg.defaultModel,
+			"custom_prices", len(costCfg.prices))
+	}
+
 	return &Agent{
 		workDir:          workDir,
 		cmd:              cmd,
@@ -279,6 +288,7 @@ func New(opts map[string]any) (core.Agent, error) {
 		allowedTools:     allowedTools,
 		disallowedTools:  disallowedTools,
 		maxContextTokens: maxContextTokens,
+		costCfg:          costCfg,
 		configEnv:        configEnv,
 		activeIdx:        -1,
 		routerURL:        routerURL,
@@ -519,6 +529,7 @@ func (a *Agent) StartSession(ctx context.Context, sessionID string) (core.AgentS
 	disTools := make([]string, len(a.disallowedTools))
 	copy(disTools, a.disallowedTools)
 	maxTok := a.maxContextTokens
+	costCfg := a.costCfg
 	model := a.model
 	effort := a.reasoningEffort
 	workDir := a.workDir
@@ -553,7 +564,7 @@ func (a *Agent) StartSession(ctx context.Context, sessionID string) (core.AgentS
 	disableVerbose := a.routerURL != ""
 	a.mu.Unlock()
 
-	return newClaudeSession(ctx, workDir, a.cmd, a.cliExtraArgs, a.cmdArgsFlag, model, effort, sessionID, mode, systemPrompt, appendSystemPrompt, tools, disTools, pluginDirs, extraEnv, platformPrompt, disableVerbose, a.spawnOpts, maxTok, a.ccDataDir, lang)
+	return newClaudeSession(ctx, workDir, a.cmd, a.cliExtraArgs, a.cmdArgsFlag, model, effort, sessionID, mode, systemPrompt, appendSystemPrompt, tools, disTools, pluginDirs, extraEnv, platformPrompt, disableVerbose, a.spawnOpts, maxTok, a.ccDataDir, lang, costCfg)
 }
 
 func (a *Agent) ListSessions(ctx context.Context) ([]core.AgentSessionInfo, error) {
@@ -918,6 +929,11 @@ func (a *Agent) WorkspaceAgentOptions() map[string]any {
 	}
 	if len(a.pluginDirs) > 0 {
 		opts["plugin_dir"] = stringsToAny(a.pluginDirs)
+	}
+	// Per-workspace agents are rebuilt from this snapshot; without the cost
+	// block they would silently fall back to the CLI's total_cost_usd.
+	if a.costCfg.source != "" {
+		opts["cost"] = a.costCfg.toOptions()
 	}
 	return opts
 }

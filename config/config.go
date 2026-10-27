@@ -512,6 +512,11 @@ type AutoCompressConfig struct {
 	Enabled    *bool `toml:"enabled,omitempty"`      // default false
 	MaxTokens  *int  `toml:"max_tokens,omitempty"`   // estimated token threshold to trigger /compress
 	MinGapMins *int  `toml:"min_gap_mins,omitempty"` // minimum minutes between auto-compress runs (default 30)
+	// HandoffAfter rotates the conversation to a fresh session (via a
+	// generated handoff document) on the Nth auto-compress instead of
+	// compressing again, so long-lived chats never stack compaction on
+	// compaction. Default 3 when auto_compress is enabled; 0 disables.
+	HandoffAfter *int `toml:"handoff_after,omitempty"`
 }
 
 // ObserveConfig controls forwarding of native terminal Claude Code sessions to a messaging platform.
@@ -1227,6 +1232,9 @@ func (c *Config) validateInternal(permissive bool) error {
 		}
 		if proj.ResetOnIdleMins != nil && *proj.ResetOnIdleMins < 0 {
 			return fmt.Errorf("config: %s.reset_on_idle_mins must be >= 0", prefix)
+		}
+		if proj.AutoCompress.HandoffAfter != nil && *proj.AutoCompress.HandoffAfter < 0 {
+			return fmt.Errorf("config: %s.auto_compress.handoff_after must be >= 0", prefix)
 		}
 		if proj.AgentSessionIdleTimeoutMins != nil && *proj.AgentSessionIdleTimeoutMins < 0 {
 			return fmt.Errorf("config: %s.agent_session_idle_timeout_mins must be >= 0", prefix)

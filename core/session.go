@@ -56,6 +56,13 @@ type Session struct {
 	// sessions cannot permanently occupy the active slot.
 	ExplicitActivatedAt time.Time `json:"explicit_activated_at,omitempty"`
 
+	// AutoCompressCount counts engine-triggered auto-compresses in this
+	// session's lifetime. auto_compress.handoff_after uses it to hand the
+	// conversation off to a fresh session on the Nth compress instead of
+	// compressing again. Resets naturally when the session is replaced
+	// (/new, auto-handoff).
+	AutoCompressCount int `json:"auto_compress_count,omitempty"`
+
 	mu   sync.Mutex `json:"-"`
 	busy bool       `json:"-"`
 }
@@ -93,6 +100,15 @@ func (s *Session) unlock(update bool) {
 	if update {
 		s.UpdatedAt = time.Now()
 	}
+}
+
+// IncrementAutoCompressCount bumps and returns the engine auto-compress
+// counter for this session.
+func (s *Session) IncrementAutoCompressCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.AutoCompressCount++
+	return s.AutoCompressCount
 }
 
 func (s *Session) AddHistory(role, content string) {
@@ -699,6 +715,7 @@ func (sm *SessionManager) saveLocked() {
 			// restart; otherwise a /switch followed by a crash would lose the
 			// exemption and the next message after restart would be rotated.
 			ExplicitActivatedAt: s.ExplicitActivatedAt,
+			AutoCompressCount:   s.AutoCompressCount,
 		}
 		s.mu.Unlock()
 	}
@@ -914,7 +931,7 @@ func (sm *SessionManager) PruneDuplicateSessions(mergeHistory bool) PruneResult 
 	defer sm.mu.Unlock()
 
 	// Group sessions by baseChat
-	chatSessions := make(map[string][]*Session) // baseChat -> sessions
+	chatSessions := make(map[string][]*Session)  // baseChat -> sessions
 	sessionToBaseChat := make(map[string]string) // session.ID -> baseChat
 
 	for userKey, sessionIDs := range sm.userSessions {

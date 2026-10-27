@@ -351,6 +351,9 @@ const (
 	MsgCompressing          MsgKey = "compressing"
 	MsgCompressNoSession    MsgKey = "compress_no_session"
 	MsgCompressDone         MsgKey = "compress_done"
+	MsgAutoHandoffStarting  MsgKey = "auto_handoff_starting"
+	MsgAutoHandoffDone      MsgKey = "auto_handoff_done"
+	MsgAutoHandoffFailed    MsgKey = "auto_handoff_failed"
 
 	MsgMemoryNotSupported MsgKey = "memory_not_supported"
 	MsgMemoryShowProject  MsgKey = "memory_show_project"
@@ -2441,6 +2444,29 @@ var messages = map[MsgKey]map[Language]string{
 		LangTraditionalChinese: "🗜 正在壓縮上下文...",
 		LangJapanese:           "🗜 コンテキストを圧縮中...",
 		LangSpanish:            "🗜 Comprimiendo contexto...",
+	},
+	// %d = how many auto-compresses have fired in this session.
+	MsgAutoHandoffStarting: {
+		LangEnglish:            "🔄 Context has been auto-compressed %d time(s) — generating a handoff document and starting a fresh session...",
+		LangChinese:            "🔄 上下文已自动压缩 %d 次，正在生成交接文档并开启新会话...",
+		LangTraditionalChinese: "🔄 上下文已自動壓縮 %d 次，正在產生交接文件並開啟新會話...",
+		LangJapanese:           "🔄 コンテキストが%d回自動圧縮されました。引き継ぎドキュメントを生成し、新しいセッションを開始します...",
+		LangSpanish:            "🔄 El contexto se ha comprimido automáticamente %d vez/veces; generando un documento de traspaso y abriendo una nueva sesión...",
+	},
+	// %s = the handoff document path.
+	MsgAutoHandoffDone: {
+		LangEnglish:            "✅ Handoff complete — fresh session started. Handoff doc: %s",
+		LangChinese:            "✅ 交接完成，已开启新会话。交接文档：%s",
+		LangTraditionalChinese: "✅ 交接完成，已開啟新會話。交接文件：%s",
+		LangJapanese:           "✅ 引き継ぎ完了、新しいセッションを開始しました。ドキュメント: %s",
+		LangSpanish:            "✅ Traspaso completado: nueva sesión iniciada. Documento: %s",
+	},
+	MsgAutoHandoffFailed: {
+		LangEnglish:            "⚠️ Handoff generation failed — keeping the current session. Send /new to reset manually.",
+		LangChinese:            "⚠️ 交接文档生成失败，已保留当前会话（可手动发送 /new 重开）。",
+		LangTraditionalChinese: "⚠️ 交接文件產生失敗，已保留目前會話（可手動傳送 /new 重開）。",
+		LangJapanese:           "⚠️ 引き継ぎドキュメントの生成に失敗しました。現在のセッションを維持します（/new で手動リセットできます）。",
+		LangSpanish:            "⚠️ Falló la generación del traspaso; se conserva la sesión actual (envía /new para reiniciar manualmente).",
 	},
 	MsgCompressNoSession: {
 		LangEnglish:            "No active session to compress. Send a message first.",

@@ -350,8 +350,14 @@ level = "info" # debug, info, warn, error
 #
 # [projects.auto_compress]
 # enabled = true
-# max_tokens = 12000     # estimated token threshold to trigger compression
+# max_tokens = 150000    # estimated token threshold to trigger compression (default 150000)
 # min_gap_mins = 30      # minimum minutes between auto-compress runs (default 30)
+# handoff_after = 3      # on the Nth auto-compress, generate a handoff document and
+#                        # rotate to a fresh session instead of compressing again.
+#                        # Keeps long-lived chats from stacking compaction on
+#                        # compaction. Default 3; 0 disables (always compress in place).
+#                        # Docs land in <work_dir>/handoff/<timestamp>-<session>.md and are
+#                        # injected as the new session's first prompt automatically.
 
 # [projects.observe]
 # enabled = true                    # Forward native terminal sessions to Slack
@@ -915,6 +921,45 @@ mode = "default" # "default" | "acceptEdits" (edit) | "plan" | "auto" | "bypassP
 # ANTHROPIC_DEFAULT_HAIKU_MODEL = "K2.6"
 # ANTHROPIC_DEFAULT_SONNET_MODEL = "K2.6"
 # ANTHROPIC_DEFAULT_OPUS_MODEL = "K2.6"
+
+# Optional: reply-footer cost source / 可选：回复尾部费用来源
+# By default the footer uses Claude Code's total_cost_usd. Behind a relay or
+# router (OmniRoute, one-api, …) that figure is priced with Claude Code's own
+# Anthropic table and can overstate third-party models by 20x or more. Set
+# source = "tokens" to price the CLI-reported token counts with your own table.
+# 默认使用 Claude Code 的 total_cost_usd。走中转/路由（OmniRoute、one-api 等）时，
+# 这个值是按 Anthropic 价格表估算的，第三方模型可能虚高几十倍。设为 "tokens"
+# 可按下面配置的单价用 CLI 上报的 token 数自行计算。
+#
+# source: "cli" (default) | "tokens" | "none"
+# Prices are USD per 1,000,000 tokens. A "*" model key acts as a catch-all.
+# 单价单位为「美元 / 百万 token」；模型键可用 "*" 作为兜底。
+#
+# [projects.agent.options.cost]
+# source = "tokens"
+# # OPTIONAL catch-all: prices EVERY unmatched model at this model's rate.
+# # Only set it if all traffic really goes to that model; otherwise leave it
+# # out so unpriced models fall back to the CLI's own total_cost_usd.
+# default_model = "deepseek-v4-flash"
+# prices_file = "prices.csv"  # optional CSV; relative to this .toml's directory
+#
+# [projects.agent.options.cost.prices."auto/best-coding"]
+# input = 0.22
+# output = 0.66
+# cache_read = 0.007
+# cache_creation = 0.22
+# # Optional native currency: CNY/RMB divides by rate (default 6), USD by 1.
+# # currency = "CNY"
+# # rate = 6
+#
+# CSV format (header optional; prices are per 1M tokens in the row's currency;
+# blank = 0; '#' starts a comment line; "*" is a catch-all). CNY/RMB rows are
+# divided by rate (default 6), USD rows by 1, so all costs end up in USD.
+# Inline [.prices] entries override CSV rows, which override the built-in table.
+#   model,input,output,cache_read,cache_creation,currency,rate
+#   auto/best-coding,1.32,3.96,0.042,1.32,CNY,6
+#   claude-sonnet-5-5,2,10,0.2,2.5,USD,1
+#   *,0.5,1.5,0,0,USD,1
 
 # Claude Code Router Integration / Claude Code Router 集成
 # Route Claude Code requests through Claude Code Router to use different model providers.
