@@ -380,7 +380,9 @@ func TestCostConfigTurnCostUSDUnknownModelIsZero(t *testing.T) {
 
 // TestHandleResultCostSourceTokens verifies that "tokens" ignores the CLI's
 // total_cost_usd (which overstates third-party models) and accumulates the
-// per-turn price instead.
+// per-turn price instead. The CLI reports modelUsage as a running total for
+// the process, so each turn supplies a larger cumulative figure and only the
+// rise may be charged.
 func TestHandleResultCostSourceTokens(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -393,7 +395,8 @@ func TestHandleResultCostSourceTokens(t *testing.T) {
 	cs.sessionID.Store("test-session")
 	cs.alive.Store(true)
 
-	result := func() map[string]any {
+	// turn n reports the cumulative totals through the end of that turn.
+	result := func(turns int) map[string]any {
 		return map[string]any{
 			"type":           "result",
 			"result":         "done",
@@ -401,14 +404,14 @@ func TestHandleResultCostSourceTokens(t *testing.T) {
 			"total_cost_usd": 0.5, // must be ignored
 			"modelUsage": map[string]any{
 				"pool-deepseek": map[string]any{
-					"inputTokens":  float64(1_000_000),
-					"outputTokens": float64(1_000_000),
+					"inputTokens":  float64(turns * 1_000_000),
+					"outputTokens": float64(turns * 1_000_000),
 				},
 			},
 		}
 	}
 
-	cs.handleResult(result())
+	cs.handleResult(result(1))
 	evt := <-cs.events
 	if !almostEqual(evt.CostUSD, 3) {
 		t.Errorf("turn 1 CostUSD = %v, want 3", evt.CostUSD)
@@ -417,13 +420,21 @@ func TestHandleResultCostSourceTokens(t *testing.T) {
 		t.Errorf("turn 1 SessionCostUSD = %v, want 3", evt.SessionCostUSD)
 	}
 
-	cs.handleResult(result())
+	cs.handleResult(result(2))
 	evt = <-cs.events
 	if !almostEqual(evt.CostUSD, 3) || !almostEqual(evt.SessionCostUSD, 6) {
 		t.Errorf("turn 2 cost = %v/%v, want 3/6", evt.CostUSD, evt.SessionCostUSD)
 	}
 	if !almostEqual(cs.GetLastCostUSD(), 3) || !almostEqual(cs.GetSessionCostUSD(), 6) {
 		t.Errorf("session reporters = %v/%v, want 3/6", cs.GetLastCostUSD(), cs.GetSessionCostUSD())
+	}
+
+	// A third turn that adds nothing billed (e.g. fully cached and priced at
+	// zero) must not re-report the running total.
+	cs.handleResult(result(2))
+	evt = <-cs.events
+	if !almostEqual(evt.CostUSD, 0) || !almostEqual(evt.SessionCostUSD, 6) {
+		t.Errorf("turn 3 cost = %v/%v, want 0/6", evt.CostUSD, evt.SessionCostUSD)
 	}
 }
 

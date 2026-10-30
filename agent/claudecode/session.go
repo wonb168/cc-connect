@@ -75,6 +75,12 @@ type claudeSession struct {
 	// costBaselineUSD is sessionCostUSD as of the end of the previous turn,
 	// i.e. the value the next turn's delta is measured from.
 	costBaselineUSD float64
+	// tokensCostBaselineUSD is the token-priced cost of the CLI process's
+	// cumulative modelUsage as of the previous turn. modelUsage (and the cost
+	// derived from it) is cumulative within one CLI process, so the per-turn
+	// charge is the rise over this baseline — the same shape as
+	// costBaselineUSD, but fed by local pricing instead of total_cost_usd.
+	tokensCostBaselineUSD float64
 
 	// gracefulStopTimeout is how long Close() waits for a clean exit
 	// (stdin close → Stop hooks → process exit) before escalating to
@@ -1081,16 +1087,35 @@ func (cs *claudeSession) handleResult(raw map[string]any) {
 		// Cost reporting disabled: the zero values make the footer omit the
 		// cost segment and mark the recorder's cost as unknown.
 	case costSourceTokens:
-		// Price the CLI-reported token counts ourselves. For third-party
-		// models total_cost_usd is ignored: behind a router it is priced with
-		// the CLI's Anthropic table and badly overstates the real cost.
-		turnCostUSD = cs.costCfg.turnCostUSD(raw, cs.GetModel())
+		// Price the CLI-reported tokens ourselves. For third-party models
+		// total_cost_usd is ignored: behind a router it is priced with the
+		// CLI's Anthropic table and badly overstates the real cost.
+		//
+		// modelUsage (one entry per model, with token counts) is CUMULATIVE
+		// for the CLI process, not per-turn — a persistent cc-connect session
+		// sees the same running totals grow across turns. So the per-turn
+		// charge is the rise in that cumulative cost since the previous turn;
+		// pricing the raw totals would report the session total every turn
+		// (and inflate session_cost_usd quadratically).
+		priced := false
+		if cumulative := cs.costCfg.turnCostUSD(raw, cs.GetModel()); cumulative > 0 {
+			priced = true
+			if cumulative >= cs.tokensCostBaselineUSD {
+				turnCostUSD = cumulative - cs.tokensCostBaselineUSD
+			} else {
+				// The CLI process restarted its counters (e.g. pool eviction
+				// or --resume into a fresh process): this turn's own usage is
+				// exactly the freshly accumulated total.
+				turnCostUSD = cumulative
+			}
+			cs.tokensCostBaselineUSD = cumulative
+		}
 		// Unpriced models (typically real Anthropic ones such as
 		// claude-sonnet-5-5) fall back to the CLI's own per-turn delta, which
 		// is accurate for Anthropic billing. Keeping costBaselineUSD current
 		// in this mode makes that delta correct.
 		if cliTotal, ok := raw["total_cost_usd"].(float64); ok && cliTotal > 0 {
-			if turnCostUSD <= 0 {
+			if !priced {
 				if cliTotal >= cs.costBaselineUSD {
 					turnCostUSD = cliTotal - cs.costBaselineUSD
 				} else {
@@ -1101,11 +1126,13 @@ func (cs *claudeSession) handleResult(raw map[string]any) {
 		}
 		if turnCostUSD > 0 {
 			cs.sessionCostUSD += turnCostUSD
-			sessionCostUSD = cs.sessionCostUSD
 			if !isCompaction {
 				cs.lastTurnCostUSD = turnCostUSD
 			}
 		}
+		// The running total stays known even when this turn added nothing
+		// (e.g. an unpriced model that also reported no CLI cost).
+		sessionCostUSD = cs.sessionCostUSD
 	default:
 		if v, ok := raw["total_cost_usd"].(float64); ok {
 			sessionCostUSD = v
